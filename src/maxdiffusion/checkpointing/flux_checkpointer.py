@@ -89,7 +89,10 @@ class FluxCheckpointer(ABC):
     transformer_params = load_flow_model(self.config.flux_name, transformer_eval_params, "cpu")
 
     weights_init_fn = functools.partial(
-        pipeline.flux.init_weights, rngs=self.rng, max_sequence_length=self.config.max_sequence_length
+        pipeline.flux.init_weights,
+        rngs=self.rng,
+        max_sequence_length=self.config.max_sequence_length,
+        eval_only=True,
     )
     flux_state, state_mesh_shardings = max_utils.setup_initial_state(
         model=pipeline.flux,
@@ -220,8 +223,8 @@ class FluxCheckpointer(ABC):
           dtype=self.config.activations_dtype,
           weights_dtype=self.config.weights_dtype,
           precision=max_utils.get_precision(self.config),
-          use_base2_exp=self.config.use_base2_exp,
-          use_experimental_scheduler=self.config.use_experimental_scheduler,
+          use_base2_exp=getattr(self.config, "use_base2_exp", False),
+          use_experimental_scheduler=getattr(self.config, "use_experimental_scheduler", False),
           remat_policy=self.config.remat_policy,
           names_which_can_be_saved=self.config.names_which_can_be_saved,
           names_which_can_be_offloaded=self.config.names_which_can_be_offloaded,
@@ -290,8 +293,8 @@ class FluxCheckpointer(ABC):
             weights_dtype=self.config.weights_dtype,
             precision=max_utils.get_precision(self.config),
             from_pt=self.config.from_pt,
-            use_base2_exp=self.config.use_base2_exp,
-            use_experimental_scheduler=self.config.use_experimental_scheduler,
+            use_base2_exp=getattr(self.config, "use_base2_exp", False),
+            use_experimental_scheduler=getattr(self.config, "use_experimental_scheduler", False),
             remat_policy=self.config.remat_policy,
             names_which_can_be_saved=self.config.names_which_can_be_saved,
             names_which_can_be_offloaded=self.config.names_which_can_be_offloaded,

@@ -605,18 +605,12 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
       train: bool = False,
   ):
     hidden_states = self.img_in(hidden_states)
-    timestep = self.timestep_embedding(timestep, 256)
-    timestep = nn.with_logical_constraint(timestep, ("activation_batch", None))
-
     if self.guidance_embeds:
-      guidance = self.timestep_embedding(guidance, 256)
+      temb = self.time_text_embed(timestep, guidance, pooled_projections)
     else:
-      guidance = None
-    temb = (
-        self.time_text_embed(timestep, pooled_projections)
-        if guidance is None
-        else self.time_text_embed(timestep, guidance, pooled_projections)
-    )
+      embedded_timestep = self.timestep_embedding(timestep, 256)
+      embedded_timestep = nn.with_logical_constraint(embedded_timestep, ("activation_batch", None))
+      temb = self.time_text_embed(embedded_timestep, pooled_projections)
 
     temb = nn.with_logical_constraint(temb, ("activation_batch", None))
 

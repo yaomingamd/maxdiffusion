@@ -651,10 +651,10 @@ def create_optimizer(config, learning_rate_scheduler):
       eps=config.adam_eps,
       weight_decay=config.adam_weight_decay,
   )
-  if config.opt_enable_grad_global_norm_clipping:
+  if getattr(config, "opt_enable_grad_global_norm_clipping", False):
     opt = optax.chain(optax.clip_by_global_norm(config.max_grad_norm), opt)
 
-  if config.opt_enable_grad_clipping:
+  if getattr(config, "opt_enable_grad_clipping", False):
     opt = optax.chain(optax.clip(config.max_grad_value), opt)
   return opt
 
