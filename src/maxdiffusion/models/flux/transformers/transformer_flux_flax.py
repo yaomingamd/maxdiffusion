@@ -256,9 +256,13 @@ class FluxTransformerBlock(nn.Module):
         use_experimental_scheduler=self.use_experimental_scheduler,
     )
 
-    # REMOVED: self.img_norm2 and self.txt_norm2 completely to stop HBM memory spilling.
-    # The mathematical reductions are handled natively below.
-
+    self.img_norm2 = nn.LayerNorm(
+        use_bias=False,
+        use_scale=False,
+        epsilon=self.eps,
+        dtype=self.dtype,
+        param_dtype=self.weights_dtype,
+    )
     self.img_mlp = nn.Sequential([
         nn.Dense(
             int(self.dim * self.mlp_ratio),
@@ -281,6 +285,13 @@ class FluxTransformerBlock(nn.Module):
         ),
     ])
 
+    self.txt_norm2 = nn.LayerNorm(
+        use_bias=False,
+        use_scale=False,
+        epsilon=self.eps,
+        dtype=self.dtype,
+        param_dtype=self.weights_dtype,
+    )
     self.txt_mlp = nn.Sequential([
         nn.Dense(
             int(self.dim * self.mlp_ratio),
@@ -304,55 +315,34 @@ class FluxTransformerBlock(nn.Module):
     ])
 
   def __call__(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None):
-    # Enforce active partitioning based on your FSDP setup config
-    hidden_states = nn.with_logical_constraint(hidden_states, ("activation_batch", None, "mlp"))
-    encoder_hidden_states = nn.with_logical_constraint(encoder_hidden_states, ("activation_batch", None, "mlp"))
-
-    # 1. First Adaptive Normalization Pass
     norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.img_norm1(hidden_states, emb=temb)
     norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.txt_norm1(
         encoder_hidden_states, emb=temb
     )
 
-    # 2. Attention Mechanics
     attn_output, context_attn_output = self.attn(
         hidden_states=norm_hidden_states,
         encoder_hidden_states=norm_encoder_hidden_states,
         image_rotary_emb=image_rotary_emb,
     )
 
-    # --- IMAGE STREAM OPTIMIZATION (img_norm2) ---
     attn_output = gate_msa * attn_output
     hidden_states = hidden_states + attn_output
-
-    # Fully fused LayerNorm + scale_mlp + shift_mlp compilation block
-    img_mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
-    img_var = jnp.mean(jnp.square(hidden_states - img_mean), axis=-1, keepdims=True)
-    img_inv_std = jax.lax.rsqrt(img_var + self.eps)
-
-    norm_hidden_states = (hidden_states - img_mean) * img_inv_std * (1 + scale_mlp) + shift_mlp
-    norm_hidden_states = nn.with_logical_constraint(norm_hidden_states, ("activation_batch", None, "mlp"))
+    norm_hidden_states = self.img_norm2(hidden_states)
+    norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
     ff_output = self.img_mlp(norm_hidden_states)
     hidden_states = hidden_states + gate_mlp * ff_output
 
-    # --- TEXT STREAM OPTIMIZATION (txt_norm2) ---
     context_attn_output = c_gate_msa * context_attn_output
     encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-    # Fully fused LayerNorm + c_scale_mlp + c_shift_mlp compilation block
-    txt_mean = jnp.mean(encoder_hidden_states, axis=-1, keepdims=True)
-    txt_var = jnp.mean(jnp.square(encoder_hidden_states - txt_mean), axis=-1, keepdims=True)
-    txt_inv_std = jax.lax.rsqrt(txt_var + self.eps)
-
-    norm_encoder_hidden_states = (encoder_hidden_states - txt_mean) * txt_inv_std * (1 + c_scale_mlp) + c_shift_mlp
-    norm_encoder_hidden_states = nn.with_logical_constraint(norm_encoder_hidden_states, ("activation_batch", None, "mlp"))
+    norm_encoder_hidden_states = self.txt_norm2(encoder_hidden_states)
+    norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
 
     context_ff_output = self.txt_mlp(norm_encoder_hidden_states)
     encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
-
-    # Safe numerical clipping limits for half precision math execution
-    if encoder_hidden_states.dtype == jnp.float16 or encoder_hidden_states.dtype == jnp.bfloat16:
+    if encoder_hidden_states.dtype == jnp.float16:
       encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
       hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -562,11 +552,13 @@ class FluxTransformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
       train: bool = False,
   ):
     hidden_states = self.img_in(hidden_states)
+    embedded_timestep = self.timestep_embedding(timestep, 256)
+    embedded_timestep = nn.with_logical_constraint(embedded_timestep, ("activation_batch", None))
+
     if self.guidance_embeds:
-      temb = self.time_text_embed(timestep, guidance, pooled_projections)
+      embedded_guidance = self.timestep_embedding(guidance, 256)
+      temb = self.time_text_embed(embedded_timestep, embedded_guidance, pooled_projections)
     else:
-      embedded_timestep = self.timestep_embedding(timestep, 256)
-      embedded_timestep = nn.with_logical_constraint(embedded_timestep, ("activation_batch", None))
       temb = self.time_text_embed(embedded_timestep, pooled_projections)
 
     temb = nn.with_logical_constraint(temb, ("activation_batch", None))
