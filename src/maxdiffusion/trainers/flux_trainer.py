@@ -75,7 +75,9 @@ class FluxTrainer(FluxCheckpointer):
     return noise_scheduler, noise_scheduler_state
 
   def calculate_tflops(self, pipeline):
-    per_device_tflops = calculate_flux_tflops(self.config, pipeline, self.total_train_batch_size, self.rng, train=True)
+    # calculate_flux_tflops expects this host's batch, not global total_train_batch_size.
+    local_batch_size = self.config.per_device_batch_size * jax.local_device_count()
+    per_device_tflops = calculate_flux_tflops(self.config, pipeline, local_batch_size, self.rng, train=True)
     max_logging.log(f"JFLUX per device TFLOPS: {per_device_tflops}")
     return per_device_tflops
 
@@ -140,13 +142,12 @@ class FluxTrainer(FluxCheckpointer):
       pipeline.scheduler = noise_scheduler
       train_states["scheduler"] = noise_scheduler_state
 
-      # Calculate tflops
+      data_shardings = self.get_data_shardings()
+      # Compile train_step before TFLOP estimate so flash-attention shard_map
+      # profiling does not perturb the train_step compilation cache key.
+      p_train_step = self.compile_train_step(pipeline, params, train_states, state_shardings, data_shardings)
       per_device_tflops = self.calculate_tflops(pipeline)
       self.per_device_tflops = per_device_tflops
-
-      data_shardings = self.get_data_shardings()
-      # Compile train_step
-      p_train_step = self.compile_train_step(pipeline, params, train_states, state_shardings, data_shardings)
       # Start training
       train_states = self.training_loop(
           p_train_step, pipeline, params, train_states, data_iterator, data_shardings, flux_learning_rate_scheduler
@@ -353,7 +354,9 @@ class FluxTrainer(FluxCheckpointer):
     return data_iterator
 
   def compile_train_step(self, pipeline, params, train_states, state_shardings, data_shardings):
-    self.rng, train_rngs = jax.random.split(self.rng)
+    # Use a fixed seed for compile-time lowering so cache keys are stable across runs.
+    compile_rng = jax.random.PRNGKey(self.config.seed)
+    _, train_rngs = jax.random.split(compile_rng)
     guidance_vec = jnp.full((self.total_train_batch_size,), self.config.guidance_scale, dtype=self.config.activations_dtype)
     with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
       train_step_partial = partial(
@@ -377,12 +380,19 @@ class FluxTrainer(FluxCheckpointer):
       max_logging.log("Precompiling...")
       s = time.time()
       dummy_batch = self.get_shaped_batch(self.config, pipeline)
+      flux_state_shardings = state_shardings["flux_state_shardings"]
       abstract_flux_state = jax.tree_util.tree_map(
-          lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), train_states[FLUX_STATE_KEY]
+          lambda x, sharding: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding),
+          train_states[FLUX_STATE_KEY],
+          flux_state_shardings,
       )
-
-      abstract_rngs = jax.tree_util.tree_map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), train_rngs)
-      p_train_step = p_train_step.lower(abstract_flux_state, dummy_batch, abstract_rngs)
+      abstract_batch = jax.tree_util.tree_map(
+          lambda x, sharding: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding),
+          dummy_batch,
+          data_shardings,
+      )
+      abstract_rngs = jax.ShapeDtypeStruct(train_rngs.shape, train_rngs.dtype)
+      p_train_step = p_train_step.lower(abstract_flux_state, abstract_batch, abstract_rngs)
       p_train_step = p_train_step.compile()
       max_logging.log(f"Compile time: {(time.time() - s )}")
       return p_train_step
