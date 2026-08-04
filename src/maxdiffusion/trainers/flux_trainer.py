@@ -238,6 +238,7 @@ class FluxTrainer(FluxCheckpointer):
       batch_images = images[i * batch_size : (i + 1) * batch_size]
       batch_images = jnp.transpose(batch_images, (0, 3, 1, 2))
       batch_images = vae_encode(batch_images)
+      batch_images = jax.block_until_ready(batch_images)
       batch_images = jnp.transpose(batch_images, (0, 3, 1, 2))
       encoded_images.append(batch_images)
 
@@ -306,7 +307,15 @@ class FluxTrainer(FluxCheckpointer):
     )
     pack_latents_p = partial(pipeline.pack_latents)
     prepare_latent_image_ids_p = partial(pipeline.prepare_latent_image_ids)
-    vae_encode_p = partial(pipeline.vae_encode, vae=pipeline.vae, state=train_states["vae_state"])
+    # Replicate VAE params for dataset preprocessing; FSDP-sharded params + eager apply
+    # can segfault during datasets.map on ROCm.
+    replicated_sharding = NamedSharding(mesh, P(None))
+    partial_device_put_replicated = partial(max_utils.device_put_replicated, sharding=replicated_sharding)
+    vae_params_replicated = jax.tree_util.tree_map(
+        partial_device_put_replicated, train_states[VAE_STATE_KEY].params
+    )
+    vae_state_replicated = train_states[VAE_STATE_KEY].replace(params=vae_params_replicated)
+    vae_encode_p = jax.jit(partial(pipeline.vae_encode, vae=pipeline.vae, state=vae_state_replicated))
 
     tokenize_fn = partial(FluxTrainer.tokenize_captions, caption_column=config.caption_column, encoder=encode_fn)
     image_transforms_fn = partial(
