@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import datetime
 import time
@@ -414,10 +415,8 @@ class FluxTrainer(FluxCheckpointer):
       max_logging.log(f"  Total train batch size (w. parallel & distributed) = {self.total_train_batch_size}")
       max_logging.log(f"  Total optimization steps = {self.config.max_train_steps}")
 
-    last_step_completion = datetime.datetime.now()
     local_metrics_file = open(self.config.metrics_file, "a", encoding="utf8") if self.config.metrics_file else None
     running_gcs_metrics = [] if self.config.gcs_metrics else None
-    example_batch = None
 
     first_profiling_step = self.config.skip_first_n_steps_for_profiler
     if max_utils.profiler_enabled(self.config) and first_profiling_step >= self.config.max_train_steps:
@@ -428,44 +427,55 @@ class FluxTrainer(FluxCheckpointer):
     start_step = get_first_step(train_states[FLUX_STATE_KEY])
     _, train_rngs = jax.random.split(self.rng)
     times = []
-    for step in np.arange(start_step, self.config.max_train_steps):
-      if max_utils.profiler_enabled(self.config) and step == first_profiling_step:
-        self._profiler = max_utils.Profiler(self.config)
-        self._profiler.start()
 
-      example_batch = load_next_batch(data_iterator, example_batch, self.config)
-      example_batch = {
+    def shard_batch(batch):
+      return {
           key: jax.device_put(jnp.asarray(value, dtype=self.config.activations_dtype), data_shardings[key])
-          for key, value in example_batch.items()
+          for key, value in batch.items()
       }
 
-      if self.config.profiler == "nsys":
-        with self.mesh:
-          flux_state, train_metric, train_rngs = p_train_step(flux_state, example_batch, train_rngs)
-      else:
-        with jax.profiler.StepTraceAnnotation("train", step_num=step):
+    example_batch = shard_batch(load_next_batch(data_iterator, None, self.config))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+      for step in np.arange(start_step, self.config.max_train_steps):
+        if max_utils.profiler_enabled(self.config) and step == first_profiling_step:
+          self._profiler = max_utils.Profiler(self.config)
+          self._profiler.start()
+
+        next_batch_future = executor.submit(load_next_batch, data_iterator, example_batch, self.config)
+        start_step_time = datetime.datetime.now()
+
+        if self.config.profiler == "nsys":
           with self.mesh:
             flux_state, train_metric, train_rngs = p_train_step(flux_state, example_batch, train_rngs)
+        else:
+          with jax.profiler.StepTraceAnnotation("train", step_num=step):
+            with self.mesh:
+              flux_state, train_metric, train_rngs = p_train_step(flux_state, example_batch, train_rngs)
+        train_metric["scalar"]["learning/loss"].block_until_ready()
 
-      samples_count = self.total_train_batch_size * (step + 1)
-      new_time = datetime.datetime.now()
+        samples_count = self.total_train_batch_size * (step + 1)
+        step_end_time = datetime.datetime.now()
 
-      record_scalar_metrics(
-          train_metric, new_time - last_step_completion, self.per_device_tflops, unet_learning_rate_scheduler(step)
-      )
-      if self.config.write_metrics:
-        write_metrics(writer, local_metrics_file, running_gcs_metrics, train_metric, step, self.config)
-      times.append(new_time - last_step_completion)
-      last_step_completion = new_time
+        record_scalar_metrics(
+            train_metric,
+            step_end_time - start_step_time,
+            self.per_device_tflops,
+            unet_learning_rate_scheduler(step),
+        )
+        if self.config.write_metrics:
+          write_metrics(writer, local_metrics_file, running_gcs_metrics, train_metric, step, self.config)
+        times.append(step_end_time - start_step_time)
 
-      if step != 0 and self.config.checkpoint_every != -1 and samples_count % self.config.checkpoint_every == 0:
-        max_logging.log(f"Saving checkpoint for step {step}")
-        train_states[FLUX_STATE_KEY] = flux_state
-        self.save_checkpoint(step, pipeline, train_states)
+        example_batch = shard_batch(next_batch_future.result())
 
-      if max_utils.profiler_enabled(self.config) and step == last_profiling_step:
-        if self._profiler is not None:
-          self._profiler.stop()
+        if step != 0 and self.config.checkpoint_every != -1 and samples_count % self.config.checkpoint_every == 0:
+          max_logging.log(f"Saving checkpoint for step {step}")
+          train_states[FLUX_STATE_KEY] = flux_state
+          self.save_checkpoint(step, pipeline, train_states)
+
+        if max_utils.profiler_enabled(self.config) and step == last_profiling_step:
+          if self._profiler is not None:
+            self._profiler.stop()
 
     train_states[FLUX_STATE_KEY] = flux_state
     if len(times) > 0:
