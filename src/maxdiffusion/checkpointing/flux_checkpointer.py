@@ -103,8 +103,14 @@ class FluxCheckpointer(ABC):
         training=is_training,
     )
     if not self.config.train_new_flux:
-      flux_state = flux_state.replace(params=transformer_params)
-      flux_state = jax.device_put(flux_state, state_mesh_shardings)
+      if jax.device_count() == jax.local_device_count():
+        flux_state = flux_state.replace(params=transformer_params)
+        flux_state = jax.device_put(flux_state, state_mesh_shardings)
+      else:
+        sharded_params = jax.tree_util.tree_map(
+            max_utils.device_put_replicated, transformer_params, state_mesh_shardings.params
+        )
+        flux_state = flux_state.replace(params=sharded_params)
     return flux_state, state_mesh_shardings, learning_rate_scheduler
 
   def create_vae_state(self, pipeline, params, checkpoint_item_name, is_training=False):
