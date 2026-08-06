@@ -114,7 +114,9 @@ class IdeogramPipeline:
         config.pretrained_model_name_or_path, subfolder="tokenizer", extra_special_tokens={}
     )
 
-    return cls(conditional_transformer, unconditional_transformer, autoencoder, text_encoder, tokenizer)
+    pipeline = cls(conditional_transformer, unconditional_transformer, autoencoder, text_encoder, tokenizer)
+    pipeline.config = config
+    return pipeline
 
   def _reorder_caption_keys(self, parsed: dict) -> dict:
     canonical_keys = ["high_level_description", "style_description", "compositional_deconstruction"]

@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PyTorch ROCm text encoder requires amdsmi init before JAX import on AMD hosts.
+try:
+  import amdsmi
+
+  amdsmi.amdsmi_init()
+except Exception:
+  pass
+
 from typing import Sequence
 import jax
 from jax.sharding import Mesh
@@ -28,64 +36,7 @@ from maxdiffusion import pyconfig, max_logging, max_utils
 from maxdiffusion.checkpointing.ideogram_checkpointer import IdeogramCheckpointer
 
 
-def _add_sharding_rule(vs: nnx.Variable, logical_axis_rules) -> nnx.Variable:
-  vs.set_metadata(sharding_rules=logical_axis_rules)
-  return vs
-
-
-def create_sharded_logical_model(model, logical_axis_rules, mesh):
-  if model is None:
-    return None
-  graphdef, state, rest_of_state = nnx.split(model, nnx.Param, ...)
-
-  def map_leaf(path, leaf):
-    if not isinstance(leaf, nnx.Variable):
-      return jax.sharding.PartitionSpec()
-    path_str = ".".join([str(p.key) if hasattr(p, "key") else str(p) for p in path])
-    # Manually implement FSDP by matching layer names since nnx.Linear lacks axis_names
-    if "qkv.kernel" in path_str:
-      return jax.sharding.PartitionSpec("fsdp", None)
-    elif "o.kernel" in path_str:
-      return jax.sharding.PartitionSpec(None, "fsdp")
-    elif "w1.kernel" in path_str or "w3.kernel" in path_str:
-      return jax.sharding.PartitionSpec("fsdp", None)
-    elif "w2.kernel" in path_str:
-      return jax.sharding.PartitionSpec(None, "fsdp")
-    elif "adaln_modulation.kernel" in path_str:
-      return jax.sharding.PartitionSpec(None, "fsdp")
-    elif "final_layer.linear.kernel" in path_str:
-      return jax.sharding.PartitionSpec("fsdp", None)
-    elif "input_proj.kernel" in path_str:
-      return jax.sharding.PartitionSpec(None, "fsdp")
-    elif "llm_cond_proj.kernel" in path_str:
-      return jax.sharding.PartitionSpec(None, "fsdp")
-    elif "embed_image_indicator.embedding" in path_str:
-      return jax.sharding.PartitionSpec(None, "fsdp")
-
-    # Fallback to replicated for small arrays like biases or norms
-    leaf_shape = leaf.shape if hasattr(leaf, "shape") else leaf.value.shape
-    if len(leaf_shape) == 1:
-      return jax.sharding.PartitionSpec(None)
-    elif len(leaf_shape) == 2:
-      return jax.sharding.PartitionSpec(None, None)
-    else:
-      return jax.sharding.PartitionSpec(*([None] * len(leaf_shape)))
-
-  pspecs = jax.tree_util.tree_map_with_path(map_leaf, state, is_leaf=lambda x: isinstance(x, nnx.Variable))
-
-  sharded_state = jax.tree.map(
-      lambda x, p: x.replace(
-          value=jax.device_put(x.get_value() if hasattr(x, "get_value") else x.value, jax.sharding.NamedSharding(mesh, p))
-      ),
-      state,
-      pspecs,
-      is_leaf=lambda x: isinstance(x, nnx.Variable),
-  )
-  model = nnx.merge(graphdef, sharded_state, rest_of_state)
-  return model
-
-
-def get_git_commit_hash():
+from maxdiffusion.models.ideogram.sharding_utils import create_sharded_logical_model
   try:
     commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode("utf-8")
     return commit_hash

@@ -44,7 +44,7 @@ from maxdiffusion.common_types import (
 )
 
 _ALLOWED_MODEL_NAMES = {WAN2_1, WAN2_2, LTX2_VIDEO, LTX2_3, Z_IMAGE, IDEOGRAM4}
-_ALLOWED_TRAINING_MODEL_NAMES = {WAN2_1}
+_ALLOWED_TRAINING_MODEL_NAMES = {WAN2_1, IDEOGRAM4}
 
 
 def _validate_model_name(model_name: str | None):

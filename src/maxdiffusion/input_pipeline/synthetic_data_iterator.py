@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from maxdiffusion import multihost_dataloading, max_logging
+from maxdiffusion.models.ideogram.ideogram_utils import compute_ideogram_token_dims
 
 
 # ============================================================================
@@ -413,6 +414,80 @@ def _make_flux_synthetic_iterator(config, mesh, global_batch_size, pipeline, is_
   return multihost_dataloading.MultiHostDataLoadIterator(data_source, mesh)
 
 
+def _generate_ideogram_synthetic_sample(rng_key, dimensions):
+  """Generate synthetic Ideogram 4 training batch."""
+  import jax.numpy as jnp
+  from maxdiffusion.models.ideogram.constants import LLM_TOKEN_INDICATOR, OUTPUT_IMAGE_INDICATOR, SEQUENCE_PADDING_INDICATOR
+
+  keys = jax.random.split(rng_key, 6)
+  bsz = dimensions["batch_size"]
+  max_text_tokens = dimensions["max_text_tokens"]
+  num_image_tokens = dimensions["num_image_tokens"]
+  seq_len = dimensions["seq_len"]
+  latent_dim = dimensions["latent_dim"]
+  llm_dim = dimensions["llm_features_dim"]
+  grid_h = dimensions["grid_h"]
+  grid_w = dimensions["grid_w"]
+
+  latents = jax.random.normal(keys[0], (bsz, num_image_tokens, latent_dim), dtype=jnp.float32)
+  llm_features = jax.random.normal(keys[1], (bsz, seq_len, llm_dim), dtype=jnp.float32)
+
+  h_idx = jnp.broadcast_to(jnp.arange(grid_h).reshape(-1, 1), (grid_h, grid_w)).reshape(-1)
+  w_idx = jnp.broadcast_to(jnp.arange(grid_w).reshape(1, -1), (grid_h, grid_w)).reshape(-1)
+  t_idx = jnp.zeros_like(h_idx)
+  image_pos = jnp.stack([t_idx, h_idx, w_idx], axis=1) + 65536
+
+  position_ids = jnp.zeros((bsz, seq_len, 3), dtype=jnp.int32)
+  segment_ids = jnp.full((bsz, seq_len), SEQUENCE_PADDING_INDICATOR, dtype=jnp.int32)
+  indicator = jnp.zeros((bsz, seq_len), dtype=jnp.int32)
+
+  text_pos = jnp.stack([jnp.arange(max_text_tokens)] * 3, axis=1)
+  position_ids = position_ids.at[:, :max_text_tokens].set(text_pos)
+  position_ids = position_ids.at[:, max_text_tokens:].set(image_pos)
+  segment_ids = segment_ids.at[:, : max_text_tokens + num_image_tokens].set(1)
+  indicator = indicator.at[:, :max_text_tokens].set(LLM_TOKEN_INDICATOR)
+  indicator = indicator.at[:, max_text_tokens:].set(OUTPUT_IMAGE_INDICATOR)
+
+  llm_mask = jnp.expand_dims((indicator == LLM_TOKEN_INDICATOR).astype(jnp.float32), -1)
+  llm_features = llm_features * llm_mask
+
+  return {
+      "latents": latents,
+      "llm_features": llm_features,
+      "position_ids": position_ids,
+      "segment_ids": segment_ids,
+      "indicator": indicator,
+  }
+
+
+def _make_ideogram_synthetic_iterator(config, mesh, global_batch_size, pipeline, is_training, num_samples):
+  per_host_batch_size = global_batch_size // jax.process_count()
+  height = getattr(config, "height", getattr(config, "resolution", 512))
+  width = getattr(config, "width", getattr(config, "resolution", 512))
+  max_text_tokens = getattr(config, "ideogram_max_text_tokens", 256)
+  grid_h, grid_w, num_image_tokens, seq_len = compute_ideogram_token_dims(height, width, max_text_tokens)
+
+  dimensions = {
+      "batch_size": per_host_batch_size,
+      "height": height,
+      "width": width,
+      "max_text_tokens": max_text_tokens,
+      "grid_h": grid_h,
+      "grid_w": grid_w,
+      "num_image_tokens": num_image_tokens,
+      "seq_len": seq_len,
+      "latent_dim": 128,
+      "llm_features_dim": 53248,
+  }
+  log_synthetic_config("IDEOGRAM4", dimensions, per_host_batch_size, is_training, num_samples)
+
+  def generate_fn(rng_key):
+    return _generate_ideogram_synthetic_sample(rng_key, dimensions)
+
+  data_source = SyntheticDataSource(generate_fn, num_samples, config.seed)
+  return multihost_dataloading.MultiHostDataLoadIterator(data_source, mesh)
+
+
 # ============================================================================
 # Public API
 # ============================================================================
@@ -447,6 +522,14 @@ def make_synthetic_iterator(config, mesh, global_batch_size, pipeline=None, is_t
   except (AttributeError, ValueError):
     pass
 
+  try:
+    model_name = getattr(config, "model_name", None)
+    if model_name == "ideogram4":
+      return _make_ideogram_synthetic_iterator(config, mesh, global_batch_size, pipeline, is_training, num_samples)
+  except (AttributeError, ValueError):
+    pass
+
   raise ValueError(
-      "No synthetic iterator implemented for model." "Supported models: wan2.1, wan2.2, flux, flux-dev, flux-schnell"
+      "No synthetic iterator implemented for model."
+      " Supported models: wan2.1, wan2.2, flux, flux-dev, flux-schnell, ideogram4"
   )

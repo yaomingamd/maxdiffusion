@@ -1,6 +1,15 @@
 import jax
 
 
+def _init_rocm_torch():
+  try:
+    import amdsmi
+
+    amdsmi.amdsmi_init()
+  except Exception:
+    pass
+
+
 class TorchaxQwen3VLTextEncoder:
 
   def __init__(self, model):
@@ -13,6 +22,7 @@ class TorchaxQwen3VLTextEncoder:
       subfolder: str = "text_encoder",
       device: str = "cpu",
   ):
+    _init_rocm_torch()
     from transformers import AutoModel, AutoConfig
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file

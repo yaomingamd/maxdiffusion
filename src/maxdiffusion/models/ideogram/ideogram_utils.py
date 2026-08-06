@@ -111,6 +111,15 @@ def _tuple_str_to_int(tuple_key):
   return tuple(int(item) if item.isdigit() else item for item in tuple_key)
 
 
+def compute_ideogram_token_dims(height: int, width: int, max_text_tokens: int):
+  patch = 2 * 8
+  grid_h = height // patch
+  grid_w = width // patch
+  num_image_tokens = grid_h * grid_w
+  seq_len = max_text_tokens + num_image_tokens
+  return grid_h, grid_w, num_image_tokens, seq_len
+
+
 def _resolve_checkpoint_path(pretrained_model_name_or_path, subfolder, filename):
   if os.path.isdir(pretrained_model_name_or_path):
     return os.path.join(pretrained_model_name_or_path, subfolder, filename)

@@ -15,16 +15,20 @@ limitations under the License.
 """
 
 import json
+from typing import Optional, Tuple
+
 import jax
 import numpy as np
-from typing import Optional, Tuple
-from maxdiffusion.pipelines.ideogram.ideogram_pipeline import IdeogramPipeline
-from maxdiffusion import max_logging
-from maxdiffusion.checkpointing.checkpointing_utils import create_orbax_checkpoint_manager
+from jax.sharding import Mesh
 import orbax.checkpoint as ocp
 from etils import epath
 
+from maxdiffusion.pipelines.ideogram.ideogram_pipeline import IdeogramPipeline
+from maxdiffusion import max_logging, max_utils
+from maxdiffusion.checkpointing.checkpointing_utils import create_orbax_checkpoint_manager
+
 IDEOGRAM_CHECKPOINT = "IDEOGRAM_CHECKPOINT"
+IDEOGRAM_STATE_KEY = "ideogram_state"
 
 
 class IdeogramCheckpointer:
@@ -33,14 +37,28 @@ class IdeogramCheckpointer:
     self.config = config
     self.checkpoint_type = checkpoint_type
     self.opt_state = None
+    self.rng = jax.random.PRNGKey(config.seed)
+    self.devices_array = max_utils.create_device_mesh(config)
+    self.mesh = Mesh(self.devices_array, config.mesh_axes)
+    self.total_train_batch_size = config.total_train_batch_size
 
     self.checkpoint_manager: ocp.CheckpointManager = create_orbax_checkpoint_manager(
-        getattr(self.config, "checkpoint_dir", ""),
+        config.checkpoint_dir,
         enable_checkpointing=True,
         save_interval_steps=1,
         checkpoint_type=checkpoint_type,
         dataset_type=getattr(config, "dataset_type", None),
     )
+
+  def _create_optimizer(self, learning_rate):
+    learning_rate_scheduler = max_utils.create_learning_rate_schedule(
+        learning_rate,
+        self.config.learning_rate_schedule_steps,
+        self.config.warmup_steps_fraction,
+        self.config.max_train_steps,
+    )
+    tx = max_utils.create_optimizer(self.config, learning_rate_scheduler)
+    return tx, learning_rate_scheduler
 
   def load_ideogram_configs_from_orbax(self, step: Optional[int]) -> Tuple[Optional[dict], Optional[int]]:
     if self.checkpoint_manager is None:
@@ -74,8 +92,6 @@ class IdeogramCheckpointer:
         ),
     )
     max_logging.log(f"restored checkpoint {restored_checkpoint.keys()}")
-    max_logging.log(f"restored checkpoint ideogram_state {restored_checkpoint.ideogram_state.keys()}")
-    max_logging.log(f"optimizer found in checkpoint {'opt_state' in restored_checkpoint.ideogram_state.keys()}")
     return restored_checkpoint, step
 
   def load_checkpoint(
@@ -87,27 +103,34 @@ class IdeogramCheckpointer:
     if restored_checkpoint:
       max_logging.log("Loading Ideogram pipeline from checkpoint")
       pipeline = IdeogramPipeline.from_checkpoint(self.config, restored_checkpoint, vae_only, load_transformer)
-      if "opt_state" in restored_checkpoint.ideogram_state.keys():
+      if "opt_state" in restored_checkpoint.ideogram_state:
         opt_state = restored_checkpoint.ideogram_state["opt_state"]
     else:
-      max_logging.log("No checkpoint found, loading pipeline from pretrained hub")
+      max_logging.log("No checkpoint found, loading pipeline from pretrained weights")
       pipeline = IdeogramPipeline.from_pretrained(self.config, vae_only, load_transformer)
 
+    pipeline.mesh = self.mesh
+    pipeline.config = self.config
     return pipeline, opt_state, step
 
-  def save_checkpoint(self, train_step, pipeline: IdeogramPipeline, train_states: dict):
-    """Saves the training state and model configurations."""
+  def save_checkpoint(self, train_step, pipeline: IdeogramPipeline, train_state):
+    """Save conditional transformer TrainState (params + opt_state + step)."""
 
-    def config_to_json(model_or_config):
-      return json.loads(model_or_config.to_json_string())
+    def config_to_json(model):
+      cfg = model.config
+      return {
+          "model_type": "ideogram4",
+          "emb_dim": cfg.emb_dim,
+          "num_heads": cfg.num_heads,
+          "in_channels": cfg.in_channels,
+          "llm_features_dim": cfg.llm_features_dim,
+          "num_layers": cfg.num_layers,
+      }
 
-    max_logging.log(f"Saving checkpoint for step {train_step}")
+    max_logging.log(f"Saving Ideogram training checkpoint for step {train_step}")
     items = {
-        "ideogram_config": ocp.args.JsonSave(config_to_json(pipeline.transformer)),
+        "ideogram_config": ocp.args.JsonSave(config_to_json(pipeline.conditional_transformer)),
+        "ideogram_state": ocp.args.PyTreeSave(train_state),
     }
-
-    items["ideogram_state"] = ocp.args.PyTreeSave(train_states)
-
-    # Save the checkpoint
     self.checkpoint_manager.save(train_step, args=ocp.args.Composite(**items))
     max_logging.log(f"Checkpoint for step {train_step} saved.")
