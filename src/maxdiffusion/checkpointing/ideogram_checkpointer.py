@@ -94,6 +94,19 @@ class IdeogramCheckpointer:
     max_logging.log(f"restored checkpoint {restored_checkpoint.keys()}")
     return restored_checkpoint, step
 
+  def _extract_ideogram_state(restored_checkpoint):
+    if restored_checkpoint is None:
+      return None
+    return getattr(restored_checkpoint, "ideogram_state", None)
+
+  @staticmethod
+  def _params_from_ideogram_state(ideogram_state):
+    if ideogram_state is None:
+      return None
+    if isinstance(ideogram_state, dict) and "params" in ideogram_state:
+      return ideogram_state["params"]
+    return ideogram_state
+
   def load_checkpoint(
       self, step=None, vae_only=False, load_transformer=True
   ) -> Tuple[IdeogramPipeline, Optional[dict], Optional[int]]:
@@ -102,9 +115,13 @@ class IdeogramCheckpointer:
 
     if restored_checkpoint:
       max_logging.log("Loading Ideogram pipeline from checkpoint")
+      ideogram_state = self._extract_ideogram_state(restored_checkpoint)
+      if isinstance(ideogram_state, dict):
+        if "opt_state" in ideogram_state:
+          opt_state = ideogram_state["opt_state"]
+        if "step" in ideogram_state:
+          step = int(ideogram_state["step"])
       pipeline = IdeogramPipeline.from_checkpoint(self.config, restored_checkpoint, vae_only, load_transformer)
-      if "opt_state" in restored_checkpoint.ideogram_state:
-        opt_state = restored_checkpoint.ideogram_state["opt_state"]
     else:
       max_logging.log("No checkpoint found, loading pipeline from pretrained weights")
       pipeline = IdeogramPipeline.from_pretrained(self.config, vae_only, load_transformer)

@@ -18,6 +18,15 @@ from ...models.ideogram.scheduler import get_schedule_for_resolution, make_step_
 from maxdiffusion import max_logging
 
 
+def _params_from_restored_checkpoint(restored_checkpoint):
+  if restored_checkpoint is None:
+    return None
+  ideogram_state = getattr(restored_checkpoint, "ideogram_state", restored_checkpoint.get("ideogram_state"))
+  if isinstance(ideogram_state, dict) and "params" in ideogram_state:
+    return ideogram_state["params"]
+  return ideogram_state
+
+
 class IdeogramPipeline:
 
   def __init__(
@@ -62,13 +71,16 @@ class IdeogramPipeline:
     unconditional_transformer = None
     if load_transformer:
       transformer_config = Ideogram4Config()
+      activation_dtype = getattr(config, "activations_dtype", jnp.bfloat16)
 
       # Load Conditional Transformer
-      conditional_transformer = nnx.eval_shape(lambda rngs: Ideogram4Transformer(rngs, transformer_config), rngs)
+      conditional_transformer = nnx.eval_shape(
+          lambda rngs: Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype), rngs
+      )
       transformer_state = nnx.state(conditional_transformer).to_pure_dict()
 
       if restored_checkpoint:
-        cond_params = restored_checkpoint["ideogram_state"]
+        cond_params = _params_from_restored_checkpoint(restored_checkpoint)
       else:
         cond_params = load_transformer_weights(
             config.pretrained_model_name_or_path,
@@ -79,11 +91,13 @@ class IdeogramPipeline:
             subfolder="transformer",
         )
 
-      conditional_transformer = Ideogram4Transformer(rngs, transformer_config)
+      conditional_transformer = Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype)
       nnx.update(conditional_transformer, cond_params)
 
       # Load Unconditional Transformer
-      unconditional_transformer = nnx.eval_shape(lambda rngs: Ideogram4Transformer(rngs, transformer_config), rngs)
+      unconditional_transformer = nnx.eval_shape(
+          lambda rngs: Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype), rngs
+      )
       if restored_checkpoint:
         uncond_params = restored_checkpoint["unconditional_ideogram_state"]
       else:
@@ -96,7 +110,7 @@ class IdeogramPipeline:
             subfolder="unconditional_transformer",
         )
 
-      unconditional_transformer = Ideogram4Transformer(rngs, transformer_config)
+      unconditional_transformer = Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype)
       nnx.update(unconditional_transformer, uncond_params)
 
     # Skip text encoder for pure test for now unless requested

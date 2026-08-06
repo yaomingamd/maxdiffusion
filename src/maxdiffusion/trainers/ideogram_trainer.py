@@ -17,7 +17,6 @@ limitations under the License.
 import datetime
 import functools
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
@@ -31,6 +30,11 @@ from jax.sharding import PartitionSpec as P
 from maxdiffusion import max_logging, max_utils, train_utils
 from maxdiffusion.checkpointing.ideogram_checkpointer import IdeogramCheckpointer
 from maxdiffusion.input_pipeline.input_pipeline_interface import make_data_iterator
+from maxdiffusion.models.ideogram.ideogram_data_utils import (
+    calculate_ideogram_train_tflops,
+    get_ideogram_tfrecord_feature_description,
+    parse_ideogram_tfrecord_features,
+)
 from maxdiffusion.models.ideogram.scheduler import get_schedule_for_resolution
 from maxdiffusion.train_utils import load_next_batch, record_scalar_metrics, write_metrics
 
@@ -65,10 +69,58 @@ class IdeogramTrainer(IdeogramCheckpointer):
           pipeline=pipeline,
           is_training=is_training,
       )
-    raise ValueError(
-        "Ideogram training currently supports dataset_type='synthetic' only. "
-        "Real-data TFRecord caching is planned next."
+
+    if config.dataset_type != "tfrecord" or not config.cache_latents_text_encoder_outputs:
+      raise ValueError(
+          "Ideogram real-data training requires dataset_type='tfrecord' and "
+          "cache_latents_text_encoder_outputs=True"
+      )
+
+    feature_description = get_ideogram_tfrecord_feature_description()
+
+    def prepare_sample_train(features):
+      return parse_ideogram_tfrecord_features(features)
+
+    return make_data_iterator(
+        config,
+        jax.process_index(),
+        jax.process_count(),
+        mesh,
+        config.global_batch_size_to_load,
+        feature_description=feature_description,
+        prepare_sample_fn=prepare_sample_train,
+        is_training=is_training,
     )
+
+  def calculate_tflops(self):
+    per_device_tflops = calculate_ideogram_train_tflops(self.config)
+    max_logging.log(f"Ideogram per-device train TFLOPs: {per_device_tflops:.4f}")
+    return per_device_tflops
+
+  def post_training_inference(self, pipeline):
+    if not getattr(self.config, "enable_post_training_inference", False):
+      return []
+    if jax.process_index() != 0:
+      return []
+
+    max_logging.log("Running post-training Ideogram inference validation...")
+    from maxdiffusion.generate_ideogram import run_with_pipeline
+
+    output_dir = getattr(self.config, "output_dir", ".")
+    os.makedirs(output_dir, exist_ok=True)
+    original_steps = self.config.num_inference_steps
+    if getattr(self.config, "post_training_inference_steps", None):
+      self.config.get_keys()["num_inference_steps"] = self.config.post_training_inference_steps
+
+    saved_paths = run_with_pipeline(
+        self.config,
+        pipeline,
+        filename_prefix="post-training-",
+        mesh=self.mesh,
+    )
+    self.config.get_keys()["num_inference_steps"] = original_steps
+    max_logging.log(f"Post-training inference saved: {saved_paths}")
+    return saved_paths
 
   def get_train_step(self, mesh, state_shardings, data_shardings, schedule_fn):
     return jax.jit(
@@ -123,6 +175,7 @@ class IdeogramTrainer(IdeogramCheckpointer):
 
     data_shardings = self.get_data_shardings(mesh)
     p_train_step = self.get_train_step(mesh, state_shardings, data_shardings, schedule_fn)
+    per_device_tflops = self.calculate_tflops()
 
     def shard_batch(batch):
       return {
@@ -141,6 +194,9 @@ class IdeogramTrainer(IdeogramCheckpointer):
       max_logging.log(f"  Batch size per device = {self.config.per_device_batch_size}")
       max_logging.log(f"  Global train batch size = {self.config.global_batch_size_to_train_on}")
       max_logging.log(f"  Steps = {self.config.max_train_steps}")
+      max_logging.log(f"  Dataset type = {self.config.dataset_type}")
+      if restore_args:
+        max_logging.log(f"  Resuming from step = {restore_args.get('step', 0)}")
 
     local_metrics_file = open(self.config.metrics_file, "a", encoding="utf8") if self.config.metrics_file else None
     running_gcs_metrics = [] if self.config.gcs_metrics else None
@@ -148,6 +204,7 @@ class IdeogramTrainer(IdeogramCheckpointer):
     start_step = int(restore_args.get("step", 0)) if restore_args else 0
 
     example_batch = shard_batch(load_next_batch(train_data_iterator, None, self.config))
+    last_metrics = None
 
     with ThreadPoolExecutor(max_workers=1) as executor:
       for step in np.arange(start_step, self.config.max_train_steps):
@@ -160,16 +217,27 @@ class IdeogramTrainer(IdeogramCheckpointer):
 
         step_end_time = datetime.datetime.now()
         record_scalar_metrics(
-            metrics, step_end_time - start_step_time, 0.0, float(learning_rate_scheduler(step))
+            metrics, step_end_time - start_step_time, per_device_tflops, float(learning_rate_scheduler(step))
         )
         if self.config.write_metrics:
           write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, self.config)
 
+        last_metrics = metrics
         example_batch = shard_batch(next_batch_future.result())
 
         if step != 0 and self.config.checkpoint_every != -1 and step % self.config.checkpoint_every == 0:
           pipeline.conditional_transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
           self.save_checkpoint(step, pipeline, state)
+
+    if self.config.write_metrics and last_metrics is not None:
+      write_metrics(
+          writer,
+          local_metrics_file,
+          running_gcs_metrics,
+          last_metrics,
+          int(self.config.max_train_steps - 1),
+          self.config,
+      )
 
     if self.config.save_final_checkpoint:
       pipeline.conditional_transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
@@ -177,6 +245,7 @@ class IdeogramTrainer(IdeogramCheckpointer):
       self.checkpoint_manager.wait_until_finished()
 
     pipeline.conditional_transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
+    self.post_training_inference(pipeline)
     return pipeline
 
 
@@ -191,8 +260,9 @@ def train_step(state, data, rng, config, schedule_fn):
 
   def loss_fn(params):
     model = nnx.merge(state.graphdef, params, state.rest_of_state)
-    clean_latents = data["latents"].astype(jnp.float32)
-    llm_features = data["llm_features"].astype(jnp.float32)
+    activation_dtype = config.activations_dtype
+    clean_latents = data["latents"].astype(activation_dtype)
+    llm_features = data["llm_features"].astype(activation_dtype)
     position_ids = data["position_ids"].astype(jnp.int32)
     segment_ids = data["segment_ids"].astype(jnp.int32)
     indicator = data["indicator"].astype(jnp.int32)
@@ -206,7 +276,7 @@ def train_step(state, data, rng, config, schedule_fn):
     noisy_latents = (1.0 - mt) * noise + mt * clean_latents
     target_v = clean_latents - noise
 
-    text_z_padding = jnp.zeros((bsz, max_text_tokens, clean_latents.shape[-1]), dtype=jnp.float32)
+    text_z_padding = jnp.zeros((bsz, max_text_tokens, clean_latents.shape[-1]), dtype=activation_dtype)
     pos_z = jnp.concatenate([text_z_padding, noisy_latents], axis=1)
 
     pred = model(llm_features, pos_z, t, position_ids, segment_ids, indicator)

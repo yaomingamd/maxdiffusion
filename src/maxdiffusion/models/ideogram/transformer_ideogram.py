@@ -79,7 +79,7 @@ def _apply_rotary_pos_emb(q: jax.Array, k: jax.Array, cos: jax.Array, sin: jax.A
 
 class Ideogram4Attention(nnx.Module):
 
-  def __init__(self, rngs: nnx.Rngs, hidden_size: int, num_heads: int, eps: float = 1e-5, dtype=jnp.float32):
+  def __init__(self, rngs: nnx.Rngs, hidden_size: int, num_heads: int, eps: float = 1e-5, dtype=jnp.bfloat16):
     self.hidden_size = hidden_size
     self.num_heads = num_heads
     self.head_dim = hidden_size // num_heads
@@ -130,7 +130,7 @@ class Ideogram4Attention(nnx.Module):
 
 class Ideogram4MLP(nnx.Module):
 
-  def __init__(self, rngs: nnx.Rngs, dim: int, hidden_dim: int, dtype=jnp.float32):
+  def __init__(self, rngs: nnx.Rngs, dim: int, hidden_dim: int, dtype=jnp.bfloat16):
     self.w1 = nnx.Linear(dim, hidden_dim, use_bias=False, rngs=rngs, dtype=dtype)
     self.w2 = nnx.Linear(hidden_dim, dim, use_bias=False, rngs=rngs, dtype=dtype)
     self.w3 = nnx.Linear(dim, hidden_dim, use_bias=False, rngs=rngs, dtype=dtype)
@@ -149,7 +149,7 @@ class Ideogram4TransformerBlock(nnx.Module):
       num_heads: int,
       norm_eps: float,
       adanln_dim: int,
-      dtype=jnp.float32,
+      dtype=jnp.bfloat16,
   ):
     self.attention = Ideogram4Attention(rngs, hidden_size, num_heads, eps=1e-5, dtype=dtype)
     self.feed_forward = Ideogram4MLP(rngs, hidden_size, intermediate_size, dtype=dtype)
@@ -203,7 +203,7 @@ def _sinusoidal_embedding(t: jax.Array, dim: int, scale: float = 1e4) -> jax.Arr
 
 class Ideogram4EmbedScalar(nnx.Module):
 
-  def __init__(self, rngs: nnx.Rngs, dim: int, input_range: Tuple[float, float], dtype=jnp.float32):
+  def __init__(self, rngs: nnx.Rngs, dim: int, input_range: Tuple[float, float], dtype=jnp.bfloat16):
     self.dim = dim
     self.range_min, self.range_max = input_range
     self.mlp_in = nnx.Linear(dim, dim, use_bias=True, rngs=rngs, dtype=dtype)
@@ -220,7 +220,7 @@ class Ideogram4EmbedScalar(nnx.Module):
 
 class Ideogram4FinalLayer(nnx.Module):
 
-  def __init__(self, rngs: nnx.Rngs, hidden_size: int, out_channels: int, adanln_dim: int, dtype=jnp.float32):
+  def __init__(self, rngs: nnx.Rngs, hidden_size: int, out_channels: int, adanln_dim: int, dtype=jnp.bfloat16):
     self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, use_bias=False, use_scale=False, dtype=dtype, rngs=rngs)
     self.linear = nnx.Linear(hidden_size, out_channels, use_bias=True, rngs=rngs, dtype=dtype)
     self.adaln_modulation = nnx.Linear(adanln_dim, hidden_size, use_bias=True, rngs=rngs, dtype=dtype)
@@ -232,7 +232,7 @@ class Ideogram4FinalLayer(nnx.Module):
 
 class Ideogram4Transformer(nnx.Module):
 
-  def __init__(self, rngs: nnx.Rngs, config: Any, dtype=jnp.float32):
+  def __init__(self, rngs: nnx.Rngs, config: Any, dtype=jnp.bfloat16):
     self.config = config
     self.dtype = dtype
 
@@ -325,4 +325,4 @@ class Ideogram4Transformer(nnx.Module):
       h = layer(h, segment_ids=segment_ids, cos=cos, sin=sin, adaln_input=adaln_input)
 
     out = self.final_layer(h, c=adaln_input)
-    return out.astype(jnp.float32)
+    return out

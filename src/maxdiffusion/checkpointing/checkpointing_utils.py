@@ -36,6 +36,7 @@ STABLE_DIFFUSION_CHECKPOINT = "STABLE_DIFFUSION_CHECKPOINT"
 STABLE_DIFFUSION_XL_CHECKPOINT = "STABLE_DIFUSSION_XL_CHECKPOINT"
 FLUX_CHECKPOINT = "FLUX_CHECKPOINT"
 WAN_CHECKPOINT = "WAN_CHECKPOINT"
+IDEOGRAM_CHECKPOINT = "IDEOGRAM_CHECKPOINT"
 Z_IMAGE_CHECKPOINT = "Z_IMAGE_CHECKPOINT"
 
 
@@ -80,6 +81,12 @@ def create_orbax_checkpoint_manager(
         "wan_state": ocp.StandardCheckpointHandler(),
         "low_noise_transformer_state": ocp.StandardCheckpointHandler(),
         "high_noise_transformer_state": ocp.StandardCheckpointHandler(),
+    }
+  elif checkpoint_type == IDEOGRAM_CHECKPOINT:
+    item_names = ("ideogram_state", "ideogram_config")
+    item_handlers = {
+        "ideogram_config": ocp.JsonCheckpointHandler(),
+        "ideogram_state": ocp.StandardCheckpointHandler(),
     }
   else:
     item_names = (

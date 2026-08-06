@@ -26,6 +26,7 @@ from jax.sharding import Mesh
 
 import time
 
+import os
 import subprocess
 import numpy as np
 from PIL import Image
@@ -37,6 +38,9 @@ from maxdiffusion.checkpointing.ideogram_checkpointer import IdeogramCheckpointe
 
 
 from maxdiffusion.models.ideogram.sharding_utils import create_sharded_logical_model
+
+
+def get_git_commit_hash():
   try:
     commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode("utf-8")
     return commit_hash
@@ -85,6 +89,67 @@ def call_pipeline(config, pipeline, prompt, negative_prompt=None):
   return images
 
 
+def _apply_pipeline_sharding(config, pipeline, mesh):
+  logical_axis_rules = tuple(tuple(rule) for rule in config.logical_axis_rules)
+  with mesh:
+    pipeline.conditional_transformer = create_sharded_logical_model(
+        pipeline.conditional_transformer, logical_axis_rules, mesh
+    )
+    pipeline.unconditional_transformer = create_sharded_logical_model(
+        pipeline.unconditional_transformer, logical_axis_rules, mesh
+    )
+    pipeline.autoencoder = create_sharded_logical_model(pipeline.autoencoder, logical_axis_rules, mesh)
+  return pipeline
+
+
+def _save_images(config, out_images, filename_prefix=""):
+  saved_image_paths = []
+  actual_prefix = filename_prefix
+  if not actual_prefix and getattr(config, "run_name", None):
+    actual_prefix = getattr(config, "run_name") + "_"
+  output_dir = getattr(config, "output_dir", None)
+  for i in range(len(out_images)):
+    filename = f"{actual_prefix}ideogram_output_{getattr(config, 'seed', 42)}_{i}.png"
+    image_path = os.path.join(output_dir, filename) if output_dir else filename
+    image_np = np.array(out_images[i])
+    image_np = (image_np * 255).astype(np.uint8)
+    img = Image.fromarray(image_np)
+    os.makedirs(os.path.dirname(image_path) or ".", exist_ok=True)
+    img.save(image_path)
+    saved_image_paths.append(image_path)
+    max_logging.log(f"Saved image to {image_path}")
+  return saved_image_paths
+
+
+def run_with_pipeline(config, pipeline, filename_prefix="", mesh=None, skip_warmup=False):
+  """Run Ideogram inference on an already-loaded pipeline (e.g. after training)."""
+  if mesh is None:
+    devices_array = max_utils.create_device_mesh(config)
+    mesh = Mesh(devices_array, config.mesh_axes)
+
+  max_logging.log("Applying sharding constraints to models...")
+  pipeline = _apply_pipeline_sharding(config, pipeline, mesh)
+
+  prompt = getattr(config, "prompt", "A cute dog")
+  negative_prompt = getattr(config, "negative_prompt", "")
+  original_num_steps = config.get_keys().get("num_inference_steps", 40)
+
+  if not skip_warmup:
+    config.get_keys()["num_inference_steps"] = 2
+    max_logging.log("Starting warmup compilation pass (2 steps)...")
+    with mesh:
+      warmup_out = call_pipeline(config, pipeline, prompt, negative_prompt)
+      jax.block_until_ready(warmup_out)
+
+  config.get_keys()["num_inference_steps"] = original_num_steps
+  max_logging.log(f"Starting generation pass ({original_num_steps} steps)...")
+  with mesh:
+    out_images = call_pipeline(config, pipeline, prompt, negative_prompt)
+    out_images = jax.block_until_ready(out_images)
+
+  return _save_images(config, out_images, filename_prefix=filename_prefix)
+
+
 def run(config, filename_prefix="", commit_hash=None):
   writer = max_utils.initialize_summary_writer(config)
   if jax.process_index() == 0 and writer:
@@ -102,23 +167,8 @@ def run(config, filename_prefix="", commit_hash=None):
   load_time = time.perf_counter() - t0_load
   max_logging.log(f"Model loaded: {load_time:.1f}s")
 
-  # Apply sharding over the device mesh
-  max_logging.log("Applying sharding constraints to models...")
   devices_array = max_utils.create_device_mesh(config)
   mesh = Mesh(devices_array, config.mesh_axes)
-  logical_axis_rules = tuple(tuple(rule) for rule in config.logical_axis_rules)
-  with mesh:
-    pipeline.conditional_transformer = create_sharded_logical_model(
-        pipeline.conditional_transformer, logical_axis_rules, mesh
-    )
-    pipeline.unconditional_transformer = create_sharded_logical_model(
-        pipeline.unconditional_transformer, logical_axis_rules, mesh
-    )
-    pipeline.autoencoder = create_sharded_logical_model(pipeline.autoencoder, logical_axis_rules, mesh)
-
-  s0 = time.perf_counter()
-  prompt = getattr(config, "prompt", "A cute dog")
-  negative_prompt = getattr(config, "negative_prompt", "")
 
   max_logging.log(f"Num steps: {config.num_inference_steps}, height: {config.height}, width: {config.width}")
   max_logging.log("===================== Model details =======================")
@@ -130,67 +180,30 @@ def run(config, filename_prefix="", commit_hash=None):
   original_enable_mld = config.get_keys().get("enable_ml_diagnostics", False)
   original_num_steps = config.get_keys().get("num_inference_steps", 40)
 
-  # 1. Warmup Compilation
-  config.get_keys()["enable_profiler"] = False
-  config.get_keys()["enable_ml_diagnostics"] = False
-  config.get_keys()["num_inference_steps"] = 2  # lower for warmup
-
-  max_logging.log("🚀 Starting warmup compilation pass (2 steps)...")
-  with mesh:
-    warmup_out = call_pipeline(config, pipeline, prompt, negative_prompt)
-    jax.block_until_ready(warmup_out)
-
-  compile_time = time.perf_counter() - s0
-  max_logging.log(f"compile_time: {compile_time}")
-
-  # 2. Actual Generation
-  config.get_keys()["num_inference_steps"] = original_num_steps
   s0 = time.perf_counter()
-  max_logging.log(f"🚀 Starting actual full-length generation pass ({original_num_steps} steps)...")
-  with mesh:
-    out_images = call_pipeline(config, pipeline, prompt, negative_prompt)
-    out_images = jax.block_until_ready(out_images)
+  saved_image_paths = run_with_pipeline(config, pipeline, filename_prefix=filename_prefix, mesh=mesh)
   generation_time = time.perf_counter() - s0
-  max_logging.log(f"generation_time: {generation_time}")
-
-  # Save images
-  saved_image_paths = []
-  actual_prefix = filename_prefix
-  if not actual_prefix and getattr(config, "run_name", None):
-    actual_prefix = getattr(config, "run_name") + "_"
-
-  for i in range(len(out_images)):
-    image_path = f"{actual_prefix}ideogram_output_{getattr(config, 'seed', 42)}_{i}.png"
-    image_np = np.array(out_images[i])
-    image_np = (image_np * 255).astype(np.uint8)
-    img = Image.fromarray(image_np)
-    img.save(image_path)
-    saved_image_paths.append(image_path)
-    max_logging.log(f"Saved image to {image_path}")
 
   timing_str = (
       f"\n{'=' * 50}\n"
       f"  TIMING SUMMARY\n"
       f"{'=' * 50}\n"
       f"  Load (checkpoint):   {load_time:>7.1f}s\n"
-      f"  Compile:             {compile_time:>7.1f}s\n"
-      f"  {'─' * 40}\n"
-      f"  Inference:           {generation_time:>7.1f}s\n"
+      f"  Generate total:      {generation_time:>7.1f}s\n"
       f"{'=' * 50}"
   )
   max_logging.log(timing_str)
 
-  # 3. Profiling Run
   if original_enable_profiler or original_enable_mld:
     profiling_steps = config.get_keys().get("profiler_steps", 5)
     config.get_keys()["enable_profiler"] = original_enable_profiler
     config.get_keys()["enable_ml_diagnostics"] = original_enable_mld
     config.get_keys()["num_inference_steps"] = profiling_steps
 
-    max_logging.log(f"🚀 Starting Profiling run ({profiling_steps} steps)...")
+    max_logging.log(f"Starting Profiling run ({profiling_steps} steps)...")
     profiler = max_utils.Profiler(config, session_name=f"denoise_profile_{profiling_steps}_steps")
     profiler.start()
-    _ = call_pipeline(config, pipeline, prompt, negative_prompt)
+    _ = call_pipeline(config, pipeline, prompt=getattr(config, "prompt", ""), negative_prompt=getattr(config, "negative_prompt", ""))
     profiler.stop()
 
   return saved_image_paths
