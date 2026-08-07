@@ -32,6 +32,10 @@ from maxdiffusion.train_utils import transformer_engine_context, validate_train_
 
 
 def train(config):
+  import tensorflow as tf
+
+  tf.config.set_visible_devices([], "GPU")
+
   from maxdiffusion.trainers.ideogram_trainer import IdeogramTrainer
 
   trainer = IdeogramTrainer(config)

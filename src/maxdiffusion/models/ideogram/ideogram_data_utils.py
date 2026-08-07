@@ -96,7 +96,7 @@ def encode_ideogram_training_example(
   """Encode one image/caption pair into cached training tensors."""
   import jax
 
-  inputs = pipeline._build_inputs_cpu([prompt], height, width)
+  inputs = pipeline._build_inputs_cpu([prompt], height, width, force_max_text_tokens=max_text_tokens)
   grid_h = inputs["grid_h"]
   grid_w = inputs["grid_w"]
   num_image_tokens = inputs["num_image_tokens"]
@@ -114,15 +114,18 @@ def encode_ideogram_training_example(
     llm_text = np.array(llm_text)
 
   llm_features = np.zeros((seq_len, llm_text.shape[-1]), dtype=np.float32)
-  llm_features[: inputs["max_text_tokens"]] = llm_text[0, : inputs["max_text_tokens"]]
+  llm_features[:max_text_tokens] = llm_text[0, :max_text_tokens]
   llm_mask = (inputs["indicator"][0] == LLM_TOKEN_INDICATOR).astype(np.float32)
   llm_features = llm_features * llm_mask[:, None]
 
   image = jnp.asarray(image_nhwc[None, ...], dtype=jnp.float32)
   vae_latents = np.asarray(pipeline.autoencoder.encode(image)[0])
-  shift, scale = get_latent_norm()
-  vae_latents = (vae_latents - shift) / scale
+  z_channels = 32
+  if vae_latents.shape[-1] == 2 * z_channels:
+    vae_latents = vae_latents[..., :z_channels]
   latents = patchify_vae_latents(vae_latents, grid_h, grid_w)
+  shift, scale = get_latent_norm()
+  latents = (latents - np.asarray(shift)) / np.asarray(scale)
 
   return {
       "latents": latents,

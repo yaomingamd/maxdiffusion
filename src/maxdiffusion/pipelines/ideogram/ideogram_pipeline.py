@@ -117,7 +117,9 @@ class IdeogramPipeline:
     max_logging.log("Initializing Torchax Text Encoder...")
     text_encoder_repo = config.pretrained_model_name_or_path
     subfolder = "text_encoder"
-    text_encoder_device = "gpu" if getattr(config, "hardware", "tpu") == "gpu" else "cpu"
+    text_encoder_device = getattr(config, "text_encoder_device", None)
+    if not text_encoder_device:
+      text_encoder_device = "gpu" if getattr(config, "hardware", "tpu") == "gpu" else "cpu"
     text_encoder = TorchaxQwen3VLTextEncoder.from_pretrained(
         text_encoder_repo, subfolder=subfolder, device=text_encoder_device
     )
@@ -158,7 +160,7 @@ class IdeogramPipeline:
         reordered[key] = parsed[key]
     return reordered
 
-  def _build_inputs_cpu(self, prompts, height, width):
+  def _build_inputs_cpu(self, prompts, height, width, force_max_text_tokens=None):
     batch_size = len(prompts)
 
     max_text_tokens = 0
@@ -171,8 +173,9 @@ class IdeogramPipeline:
 
       try:
         parsed = json.loads(prompt)
-        parsed = self._reorder_caption_keys(parsed)
-        prompt = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(parsed, dict):
+          parsed = self._reorder_caption_keys(parsed)
+          prompt = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
       except json.JSONDecodeError:
         pass
 
@@ -186,6 +189,8 @@ class IdeogramPipeline:
       tokenized.append((token_ids, num_text_tokens))
 
     max_text_tokens = max(num_text for _, num_text in tokenized)
+    if force_max_text_tokens is not None:
+      max_text_tokens = int(force_max_text_tokens)
 
     patch_size = 2
     ae_scale_factor = 8

@@ -2,9 +2,10 @@
 Write Ideogram 4 training TFRecords with cached VAE latents and Qwen3-VL features.
 
 Modes:
-  synthetic - random tensors for pipeline validation (no model required)
-  npz       - one sample per .npz file with keys latents, llm_features, position_ids, segment_ids, indicator
-  encode    - CSV manifest (image_path,caption) encoded through the Ideogram pipeline
+  synthetic   - random tensors for pipeline validation (no model required)
+  npz         - one sample per .npz file with keys latents, llm_features, position_ids, segment_ids, indicator
+  encode      - CSV manifest (image_path,caption) encoded through the Ideogram pipeline
+  huggingface - HuggingFace dataset (dataset_name) encoded through the Ideogram pipeline
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import csv
 import glob
 import os
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import numpy as np
 import tensorflow as tf
@@ -48,6 +49,10 @@ def _load_image_nhwc(path: str, height: int, width: int) -> np.ndarray:
   return arr
 
 
+def _pil_to_nhwc(image, height: int, width: int) -> np.ndarray:
+  return np.asarray(image.convert("RGB").resize((width, height)), dtype=np.float32) / 127.5 - 1.0
+
+
 def _generate_synthetic_sample(config) -> dict[str, np.ndarray]:
   height = getattr(config, "height", config.resolution)
   width = getattr(config, "width", config.resolution)
@@ -71,6 +76,10 @@ def _generate_synthetic_sample(config) -> dict[str, np.ndarray]:
 
 
 def write_tfrecords(config, samples: list[dict[str, np.ndarray]]) -> None:
+  _write_tfrecords_streaming(config, iter(samples), total_count=len(samples))
+
+
+def _write_tfrecords_streaming(config, sample_iter: Iterator[dict[str, np.ndarray]], total_count: int | None = None) -> None:
   tfrecords_dir = config.tfrecords_dir
   os.makedirs(tfrecords_dir, exist_ok=True)
   num_shards = max(1, int(getattr(config, "data_num_shards", 1)))
@@ -78,42 +87,102 @@ def write_tfrecords(config, samples: list[dict[str, np.ndarray]]) -> None:
       tf.io.TFRecordWriter(os.path.join(tfrecords_dir, f"shard-{i:05d}-of-{num_shards:05d}.tfrec"))
       for i in range(num_shards)
   ]
-  for i, sample in enumerate(samples):
-    writers[i % num_shards].write(create_ideogram_tfrecord_example(sample))
+  count = 0
+  for sample in sample_iter:
+    writers[count % num_shards].write(create_ideogram_tfrecord_example(sample))
+    count += 1
+    if count % 10 == 0:
+      max_logging.log(f"Wrote {count} TFRecords...")
   for writer in writers:
     writer.close()
-  max_logging.log(f"Wrote {len(samples)} Ideogram TFRecords to {tfrecords_dir}")
+  suffix = f" of {total_count}" if total_count is not None else ""
+  max_logging.log(f"Wrote {count}{suffix} Ideogram TFRecords to {tfrecords_dir}")
+
+
+def _iter_huggingface_samples(config) -> Iterator[dict[str, np.ndarray]]:
+  from datasets import load_dataset
+
+  from maxdiffusion.pipelines.ideogram.ideogram_pipeline import IdeogramPipeline
+
+  height = getattr(config, "height", config.resolution)
+  width = getattr(config, "width", config.resolution)
+  image_column = getattr(config, "image_column", "image")
+  caption_column = getattr(config, "caption_column", "text")
+  split = getattr(config, "hf_split", "train")
+  dataset_name = config.dataset_name
+  if not dataset_name:
+    raise ValueError("huggingface mode requires dataset_name to be set")
+
+  max_records = int(getattr(config, "ideogram_tfrecord_num_records", -1))
+  if max_records <= 0:
+    max_records = int(getattr(config, "max_train_samples", -1))
+  if max_records <= 0:
+    max_records = None
+
+  max_logging.log(f"Loading HuggingFace dataset {dataset_name} split={split}")
+  ds = load_dataset(dataset_name, split=split)
+  if max_records is not None:
+    ds = ds.select(range(min(len(ds), max_records)))
+  max_logging.log(f"Encoding {len(ds)} samples at {height}x{width}")
+
+  pipeline = IdeogramPipeline.from_pretrained(config, load_transformer=False)
+  for idx, row in enumerate(ds):
+    image = _pil_to_nhwc(row[image_column], height, width)
+    caption = row[caption_column]
+    if caption is None:
+      caption = ""
+    max_logging.log(f"Encoding sample {idx + 1}/{len(ds)}")
+    yield encode_ideogram_training_example(pipeline, image, caption, height, width)
 
 
 def generate_dataset(config) -> None:
+  try:
+    import amdsmi
+
+    amdsmi.amdsmi_init()
+  except Exception:
+    pass
+
   mode = getattr(config, "ideogram_tfrecord_mode", "synthetic")
   num_records = int(getattr(config, "ideogram_tfrecord_num_records", 32))
-  samples: list[dict[str, np.ndarray]] = []
 
   if mode == "synthetic":
-    for _ in range(num_records):
-      samples.append(_generate_synthetic_sample(config))
-  elif mode == "npz":
+    samples = [_generate_synthetic_sample(config) for _ in range(num_records)]
+    write_tfrecords(config, samples)
+    return
+
+  if mode == "npz":
     npz_dir = config.ideogram_npz_dir
     paths = sorted(glob.glob(os.path.join(npz_dir, "*.npz")))
+    samples = []
     for path in paths:
       with np.load(path) as data:
         samples.append({key: np.asarray(data[key]) for key in data.files})
-  elif mode == "encode":
+    write_tfrecords(config, samples)
+    return
+
+  if mode == "encode":
     from maxdiffusion.pipelines.ideogram.ideogram_pipeline import IdeogramPipeline
 
     height = getattr(config, "height", config.resolution)
     width = getattr(config, "width", config.resolution)
     pipeline = IdeogramPipeline.from_pretrained(config, load_transformer=False)
-    with open(config.ideogram_manifest_csv, newline="", encoding="utf-8") as f:
-      reader = csv.DictReader(f)
-      for row in reader:
-        image = _load_image_nhwc(row["image_path"], height, width)
-        samples.append(encode_ideogram_training_example(pipeline, image, row["caption"], height, width))
-  else:
-    raise ValueError(f"Unsupported ideogram_tfrecord_mode: {mode}")
 
-  write_tfrecords(config, samples)
+    def _iter_csv():
+      with open(config.ideogram_manifest_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+          image = _load_image_nhwc(row["image_path"], height, width)
+          yield encode_ideogram_training_example(pipeline, image, row["caption"], height, width)
+
+    _write_tfrecords_streaming(config, _iter_csv())
+    return
+
+  if mode == "huggingface":
+    _write_tfrecords_streaming(config, _iter_huggingface_samples(config))
+    return
+
+  raise ValueError(f"Unsupported ideogram_tfrecord_mode: {mode}")
 
 
 def main(argv: Sequence[str]) -> None:
