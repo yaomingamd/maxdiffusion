@@ -253,8 +253,11 @@ class IdeogramPipeline:
       negative_prompts: Optional[List[str]] = None,
       height: int = 1024,
       width: int = 1024,
-      num_steps: int = 50,
-      guidance_scale: float = 7.0,
+      num_steps: int = 48,
+      guidance_scale: Optional[float] = None,
+      guidance_schedule: Optional[List[float]] = None,
+      schedule_mu: float = 0.0,
+      schedule_std: float = 1.5,
       seed: int = 42,
   ):
     if negative_prompts is None:
@@ -287,43 +290,51 @@ class IdeogramPipeline:
     latent_dim = 128  # 32 * patch_size * patch_size
     z = jax.random.normal(key, (batch_size, num_image_tokens, latent_dim), dtype=jnp.float32)
 
-    # Precompute the scheduler timesteps array using the Ideogram 4 scheduler
-    schedule_fn = get_schedule_for_resolution((height, width), known_mean=0.5)
+    if guidance_schedule is not None:
+      if len(guidance_schedule) != num_steps:
+        raise ValueError(
+            f"guidance_schedule length {len(guidance_schedule)} != num_steps {num_steps}"
+        )
+      gw_step_order = tuple(float(x) for x in guidance_schedule)
+    elif guidance_scale is not None:
+      gw_step_order = (float(guidance_scale),) * num_steps
+    else:
+      # Official V4_QUALITY_48 default: 45 steps @ 7.0, 3 polish steps @ 3.0.
+      gw_step_order = (7.0,) * max(0, num_steps - 3) + (3.0,) * min(3, num_steps)
+
+    schedule_fn = get_schedule_for_resolution(
+        (height, width), known_mean=schedule_mu, std=schedule_std
+    )
     step_intervals = make_step_intervals(num_steps)
-    # Compute schedule evaluated at all intervals. schedule_fn returns a continuous scalar mapping.
     sigmas = jnp.array(
         [float(schedule_fn(jnp.array([step_intervals[i]]))[0]) for i in range(num_steps + 1)], dtype=jnp.float32
     )
+    guidance_weights = jnp.array(gw_step_order, dtype=jnp.float32)
 
     # Padding for text latents
     text_z_padding = jnp.zeros((batch_size, max_text_tokens, latent_dim), dtype=jnp.float32)
 
     # 2. Denoising loop in JAX
-    # Define the loop step
     def denoise_step(i_fori, val):
       z_curr, llm_pos, llm_neg = val
 
-      # Euler step in model-time (mt) convention where mt increases from 0 (noisy) to 1 (clean).
       i = (num_steps - 1) - i_fori
       mt_curr = sigmas[i + 1]
       mt_next = sigmas[i]
 
       t = jnp.full((batch_size,), mt_curr, dtype=jnp.float32)
 
-      # Positive branch (conditional, text + image)
       pos_z = jnp.concatenate([text_z_padding, z_curr], axis=1)
       pos_v = self.conditional_transformer(llm_pos, pos_z, t, pos_position_ids, pos_segment_ids, pos_indicator)[
           :, max_text_tokens:
       ]
 
-      # Negative branch (unconditional, image only, asymmetric CFG)
       neg_z = z_curr
       neg_v = self.unconditional_transformer(llm_neg, neg_z, t, neg_position_ids, neg_segment_ids, neg_indicator)
 
-      # CFG: standard formula v = uncond + guidance * (cond - uncond)
-      v = neg_v + guidance_scale * (pos_v - neg_v)
+      gw = guidance_weights[i_fori]
+      v = gw * pos_v + (1.0 - gw) * neg_v
 
-      # Euler step: z_next = z + v * delta_mt
       delta_mt = mt_next - mt_curr
       z_next = z_curr + v * delta_mt
 

@@ -38,6 +38,37 @@ from maxdiffusion.checkpointing.ideogram_checkpointer import IdeogramCheckpointe
 
 
 from maxdiffusion.models.ideogram.sharding_utils import create_sharded_logical_model
+from maxdiffusion.models.ideogram.sampler_configs import get_sampler_preset, guidance_schedule_step_order
+
+
+def _resolve_sampler_kwargs(config) -> dict:
+  """Map config / preset fields to IdeogramPipeline.generate() kwargs."""
+  preset_name = getattr(config, "ideogram_sampler_preset", None)
+  if preset_name:
+    preset = get_sampler_preset(str(preset_name))
+    return {
+        "num_steps": preset.num_steps,
+        "guidance_schedule": list(guidance_schedule_step_order(preset)),
+        "schedule_mu": preset.mu,
+        "schedule_std": preset.std,
+    }
+
+  num_steps = getattr(config, "num_inference_steps", 48)
+  schedule_mu = getattr(config, "ideogram_schedule_mu", 0.0)
+  schedule_std = getattr(config, "ideogram_schedule_std", 1.5)
+  guidance_schedule = getattr(config, "ideogram_guidance_schedule", None)
+  guidance_scale = getattr(config, "guidance_scale", None)
+
+  kwargs = {
+      "num_steps": num_steps,
+      "schedule_mu": schedule_mu,
+      "schedule_std": schedule_std,
+  }
+  if guidance_schedule:
+    kwargs["guidance_schedule"] = list(guidance_schedule)
+  elif guidance_scale is not None:
+    kwargs["guidance_scale"] = float(guidance_scale)
+  return kwargs
 
 
 def get_git_commit_hash():
@@ -59,8 +90,7 @@ def call_pipeline(config, pipeline, prompt, negative_prompt=None):
   seed = getattr(config, "seed", 42)
   height = getattr(config, "height", 256)
   width = getattr(config, "width", 256)
-  num_inference_steps = getattr(config, "num_inference_steps", 50)
-  guidance_scale = getattr(config, "guidance_scale", 7.0)
+  sampler_kwargs = _resolve_sampler_kwargs(config)
 
   # Convert single prompt to list of prompts to match pipeline batch dimension
   if isinstance(prompt, str):
@@ -82,9 +112,8 @@ def call_pipeline(config, pipeline, prompt, negative_prompt=None):
       negative_prompts=negative_prompts,
       height=height,
       width=width,
-      num_steps=num_inference_steps,
-      guidance_scale=guidance_scale,
       seed=seed,
+      **sampler_kwargs,
   )
   return images
 
@@ -132,16 +161,22 @@ def run_with_pipeline(config, pipeline, filename_prefix="", mesh=None, skip_warm
 
   prompt = getattr(config, "prompt", "A cute dog")
   negative_prompt = getattr(config, "negative_prompt", "")
-  original_num_steps = config.get_keys().get("num_inference_steps", 40)
+  sampler_kwargs = _resolve_sampler_kwargs(config)
+  original_num_steps = sampler_kwargs["num_steps"]
 
-  if not skip_warmup:
-    config.get_keys()["num_inference_steps"] = 2
+  if not skip_warmup and not getattr(config, "ideogram_skip_warmup", False):
+    keys = config.get_keys()
+    saved_preset = keys.get("ideogram_sampler_preset")
+    keys["ideogram_sampler_preset"] = ""
+    keys["num_inference_steps"] = 2
+    keys["guidance_scale"] = 7.0
     max_logging.log("Starting warmup compilation pass (2 steps)...")
     with mesh:
       warmup_out = call_pipeline(config, pipeline, prompt, negative_prompt)
       jax.block_until_ready(warmup_out)
+    if saved_preset is not None:
+      keys["ideogram_sampler_preset"] = saved_preset
 
-  config.get_keys()["num_inference_steps"] = original_num_steps
   max_logging.log(f"Starting generation pass ({original_num_steps} steps)...")
   with mesh:
     out_images = call_pipeline(config, pipeline, prompt, negative_prompt)
@@ -170,7 +205,13 @@ def run(config, filename_prefix="", commit_hash=None):
   devices_array = max_utils.create_device_mesh(config)
   mesh = Mesh(devices_array, config.mesh_axes)
 
-  max_logging.log(f"Num steps: {config.num_inference_steps}, height: {config.height}, width: {config.width}")
+  sampler_kwargs = _resolve_sampler_kwargs(config)
+  preset_name = getattr(config, "ideogram_sampler_preset", None)
+  max_logging.log(
+      f"Sampler: preset={preset_name or 'custom'}, steps={sampler_kwargs['num_steps']}, "
+      f"mu={sampler_kwargs['schedule_mu']}, std={sampler_kwargs['schedule_std']}"
+  )
+  max_logging.log(f"Height: {config.height}, width: {config.width}")
   max_logging.log("===================== Model details =======================")
   max_logging.log(f"hardware: {jax.devices()[0].platform}")
   max_logging.log(f"number of devices: {jax.device_count()}")
