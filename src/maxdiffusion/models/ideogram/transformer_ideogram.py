@@ -1,9 +1,13 @@
+import functools
 import math
-from typing import Tuple, Any
+from typing import Any, Optional, Tuple
+
 import jax
 import jax.numpy as jnp
-from flax import nnx
 from dataclasses import dataclass
+import flax.linen as nn
+from flax import nnx
+from jax.sharding import Mesh
 
 
 @dataclass
@@ -79,16 +83,80 @@ def _apply_rotary_pos_emb(q: jax.Array, k: jax.Array, cos: jax.Array, sin: jax.A
 
 class Ideogram4Attention(nnx.Module):
 
-  def __init__(self, rngs: nnx.Rngs, hidden_size: int, num_heads: int, eps: float = 1e-5, dtype=jnp.bfloat16):
+  def __init__(
+      self,
+      rngs: nnx.Rngs,
+      hidden_size: int,
+      num_heads: int,
+      eps: float = 1e-5,
+      dtype=jnp.bfloat16,
+      attention_kernel: str = "dot_product",
+      mesh: Optional[Mesh] = None,
+  ):
     self.hidden_size = hidden_size
     self.num_heads = num_heads
     self.head_dim = hidden_size // num_heads
     self.dtype = dtype
+    self.attention_kernel = attention_kernel
+    self.mesh = mesh
+    self.dpa_layer = None
 
     self.qkv = nnx.Linear(hidden_size, hidden_size * 3, use_bias=False, rngs=rngs, dtype=dtype)
     self.norm_q = nnx.RMSNorm(self.head_dim, epsilon=eps, dtype=dtype, rngs=rngs)
     self.norm_k = nnx.RMSNorm(self.head_dim, epsilon=eps, dtype=dtype, rngs=rngs)
     self.o = nnx.Linear(hidden_size, hidden_size, use_bias=False, rngs=rngs, dtype=dtype)
+
+    if attention_kernel == "cudnn_flash_te":
+      from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
+
+      jax.config.update("jax_use_shardy_partitioner", False)
+      dpa = DotProductAttention(
+          head_dim=self.head_dim,
+          num_attention_heads=num_heads,
+          num_gqa_groups=num_heads,
+          attn_mask_type="padding",
+          attn_bias_type="NO_BIAS",
+          dtype=dtype,
+          qkv_layout="BSHD_BSHD_BSHD",
+          scale_factor=1.0 / math.sqrt(self.head_dim),
+          transpose_batch_sequence=False,
+      )
+      self.dpa_layer = functools.partial(dpa.apply, {})
+
+  def _dot_product_attention(
+      self, q: jax.Array, k: jax.Array, v: jax.Array, segment_ids: jax.Array
+  ) -> jax.Array:
+    attn_mask = jnp.expand_dims(segment_ids, axis=2) == jnp.expand_dims(segment_ids, axis=1)
+    attn_mask = jnp.expand_dims(attn_mask, axis=1)
+
+    scale = 1.0 / math.sqrt(self.head_dim)
+    attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+    attn_weights = jnp.where(attn_mask, attn_weights, -1e10)
+    attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+    return jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
+
+  def _te_flash_attention(self, q: jax.Array, k: jax.Array, v: jax.Array, segment_ids: jax.Array) -> jax.Array:
+    from maxdiffusion.models.attention_flax import BATCH, D_KV, HEAD, LENGTH
+    from transformer_engine.jax.attention import SequenceDescriptor  # pytype: disable=import-error
+
+    q_bshd = jnp.transpose(q, (0, 2, 1, 3))
+    k_bshd = jnp.transpose(k, (0, 2, 1, 3))
+    v_bshd = jnp.transpose(v, (0, 2, 1, 3))
+
+    axis_names = nn.logical_to_mesh_axes((BATCH, LENGTH, HEAD, D_KV))
+    q_bshd = jax.lax.with_sharding_constraint(q_bshd, axis_names)
+    k_bshd = jax.lax.with_sharding_constraint(k_bshd, axis_names)
+    v_bshd = jax.lax.with_sharding_constraint(v_bshd, axis_names)
+
+    te_segment_ids = jnp.where(segment_ids > 0, 1, 0).astype(jnp.int32)
+    sequence_descriptor = SequenceDescriptor.from_segment_ids_and_pos(
+        segment_ids=te_segment_ids,
+        segment_pos=None,
+        is_thd=False,
+        is_segment_ids_reordered=False,
+    )
+    out_bshd = self.dpa_layer(q_bshd, k_bshd, v_bshd, sequence_descriptor=sequence_descriptor)
+    return jnp.transpose(out_bshd, (0, 2, 1, 3))
 
   def __call__(self, x: jax.Array, segment_ids: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     batch_size, seq_len, _ = x.shape
@@ -96,33 +164,20 @@ class Ideogram4Attention(nnx.Module):
     qkv = self.qkv(x)
     qkv = qkv.reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))
 
-    q = qkv[:, :, 0]
-    k = qkv[:, :, 1]
+    q = self.norm_q(qkv[:, :, 0])
+    k = self.norm_k(qkv[:, :, 1])
     v = qkv[:, :, 2]
 
-    q = self.norm_q(q)
-    k = self.norm_k(k)
-
-    # Transpose to (B, num_heads, L, head_dim)
     q = jnp.transpose(q, (0, 2, 1, 3))
     k = jnp.transpose(k, (0, 2, 1, 3))
     v = jnp.transpose(v, (0, 2, 1, 3))
 
     q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
-    # Block-diagonal mask from segment ids
-    attn_mask = jnp.expand_dims(segment_ids, axis=2) == jnp.expand_dims(segment_ids, axis=1)
-    attn_mask = jnp.expand_dims(attn_mask, axis=1)  # (B, 1, L, L)
-
-    # JAX scaled dot product attention
-    scale = 1.0 / math.sqrt(self.head_dim)
-    attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
-
-    # apply mask
-    attn_weights = jnp.where(attn_mask, attn_weights, -1e10)
-
-    attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-    out = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
+    if self.attention_kernel == "cudnn_flash_te":
+      out = self._te_flash_attention(q, k, v, segment_ids)
+    else:
+      out = self._dot_product_attention(q, k, v, segment_ids)
 
     out = jnp.transpose(out, (0, 2, 1, 3)).reshape((batch_size, seq_len, self.hidden_size))
     return self.o(out)
@@ -150,8 +205,18 @@ class Ideogram4TransformerBlock(nnx.Module):
       norm_eps: float,
       adanln_dim: int,
       dtype=jnp.bfloat16,
+      attention_kernel: str = "dot_product",
+      mesh: Optional[Mesh] = None,
   ):
-    self.attention = Ideogram4Attention(rngs, hidden_size, num_heads, eps=1e-5, dtype=dtype)
+    self.attention = Ideogram4Attention(
+        rngs,
+        hidden_size,
+        num_heads,
+        eps=1e-5,
+        dtype=dtype,
+        attention_kernel=attention_kernel,
+        mesh=mesh,
+    )
     self.feed_forward = Ideogram4MLP(rngs, hidden_size, intermediate_size, dtype=dtype)
 
     self.attention_norm1 = nnx.RMSNorm(hidden_size, epsilon=norm_eps, dtype=dtype, rngs=rngs)
@@ -232,9 +297,18 @@ class Ideogram4FinalLayer(nnx.Module):
 
 class Ideogram4Transformer(nnx.Module):
 
-  def __init__(self, rngs: nnx.Rngs, config: Any, dtype=jnp.bfloat16):
+  def __init__(
+      self,
+      rngs: nnx.Rngs,
+      config: Any,
+      dtype=jnp.bfloat16,
+      attention_kernel: str = "dot_product",
+      mesh: Optional[Mesh] = None,
+  ):
     self.config = config
     self.dtype = dtype
+    self.attention_kernel = attention_kernel
+    self.mesh = mesh
 
     head_dim = config.emb_dim // config.num_heads
 
@@ -263,6 +337,8 @@ class Ideogram4Transformer(nnx.Module):
                 norm_eps=config.norm_eps,
                 adanln_dim=config.adanln_dim,
                 dtype=dtype,
+                attention_kernel=attention_kernel,
+                mesh=mesh,
             )
             for _ in range(config.num_layers)
         ]

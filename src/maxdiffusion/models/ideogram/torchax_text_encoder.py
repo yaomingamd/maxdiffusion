@@ -127,6 +127,9 @@ class TorchaxQwen3VLTextEncoder:
           attention_mask=pt_attention_mask,
           pos_2d=pt_pos_2d,
       )
+      # Flush HIP work before JAX reuses the same GPU (avoids VAE decode segfaults).
+      if device.type != "cpu":
+        torch.cuda.synchronize()
 
     return jax.numpy.array(output.to(torch.float32).cpu().numpy())
 

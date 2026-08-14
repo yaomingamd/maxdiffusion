@@ -1,6 +1,8 @@
 # pylint: disable=missing-module-docstring, missing-class-docstring, missing-function-docstring, too-many-positional-arguments, import-outside-toplevel, redefined-outer-name
 from typing import Optional, Any, List
 
+import json
+
 import numpy as np
 
 import jax
@@ -15,6 +17,7 @@ from ...models.ideogram.ideogram_utils import load_transformer_weights, load_vae
 from ...models.ideogram.torchax_text_encoder import TorchaxQwen3VLTextEncoder
 from ...models.ideogram.latent_norm import get_latent_norm
 from ...models.ideogram.scheduler import get_schedule_for_resolution, make_step_intervals
+from ...models.ideogram.vae_decode_utils import decode_latents_with_vae
 from maxdiffusion import max_logging
 
 
@@ -72,11 +75,20 @@ class IdeogramPipeline:
     if load_transformer:
       transformer_config = Ideogram4Config()
       activation_dtype = getattr(config, "activations_dtype", jnp.bfloat16)
+      attention_kernel = getattr(config, "attention", "dot_product")
+      mesh = getattr(config, "mesh", None)
+
+      def _make_transformer(rngs):
+        return Ideogram4Transformer(
+            rngs,
+            transformer_config,
+            dtype=activation_dtype,
+            attention_kernel=attention_kernel,
+            mesh=mesh,
+        )
 
       # Load Conditional Transformer
-      conditional_transformer = nnx.eval_shape(
-          lambda rngs: Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype), rngs
-      )
+      conditional_transformer = nnx.eval_shape(_make_transformer, rngs)
       transformer_state = nnx.state(conditional_transformer).to_pure_dict()
 
       if restored_checkpoint:
@@ -91,13 +103,11 @@ class IdeogramPipeline:
             subfolder="transformer",
         )
 
-      conditional_transformer = Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype)
+      conditional_transformer = _make_transformer(rngs)
       nnx.update(conditional_transformer, cond_params)
 
       # Load Unconditional Transformer
-      unconditional_transformer = nnx.eval_shape(
-          lambda rngs: Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype), rngs
-      )
+      unconditional_transformer = nnx.eval_shape(_make_transformer, rngs)
       if restored_checkpoint:
         uncond_params = restored_checkpoint["unconditional_ideogram_state"]
       else:
@@ -110,7 +120,7 @@ class IdeogramPipeline:
             subfolder="unconditional_transformer",
         )
 
-      unconditional_transformer = Ideogram4Transformer(rngs, transformer_config, dtype=activation_dtype)
+      unconditional_transformer = _make_transformer(rngs)
       nnx.update(unconditional_transformer, uncond_params)
 
     # Skip text encoder for pure test for now unless requested
@@ -160,6 +170,26 @@ class IdeogramPipeline:
         reordered[key] = parsed[key]
     return reordered
 
+  def _normalize_prompt_text(self, prompt: str) -> str:
+    """Canonicalize JSON caption prompts; pass through plain text unchanged."""
+    try:
+      parsed = json.loads(prompt)
+      if isinstance(parsed, dict):
+        parsed = self._reorder_caption_keys(parsed)
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    except json.JSONDecodeError:
+      pass
+    return prompt
+
+  def _tokenize_prompt(self, prompt: str) -> tuple[np.ndarray, int]:
+    """Tokenize one prompt with the Qwen chat template (matches diffusers encode_prompt)."""
+    text_prompt = self._normalize_prompt_text(prompt)
+    messages = [{"role": "user", "content": [{"type": "text", "text": text_prompt}]}]
+    text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    token_ids = self.tokenizer(text, return_tensors="np", add_special_tokens=False)["input_ids"][0]
+    num_text_tokens = int(token_ids.shape[0])
+    return token_ids.astype(np.int32), num_text_tokens
+
   def _build_inputs_cpu(self, prompts, height, width, force_max_text_tokens=None):
     batch_size = len(prompts)
 
@@ -169,23 +199,11 @@ class IdeogramPipeline:
 
     tokenized = []
     for prompt in prompts:
-      import json
-
-      try:
-        parsed = json.loads(prompt)
-        if isinstance(parsed, dict):
-          parsed = self._reorder_caption_keys(parsed)
-          prompt = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-      except json.JSONDecodeError:
-        pass
-
-      if prompt != "":
-        encoded = self.tokenizer(prompt, return_tensors="np", add_special_tokens=True)
-        token_ids = encoded["input_ids"][0]
-        num_text_tokens = int(token_ids.shape[0])
-      else:
-        num_text_tokens = 256
-        token_ids = np.zeros((num_text_tokens,), dtype=np.int32)
+      token_ids, num_text_tokens = self._tokenize_prompt(prompt)
+      if force_max_text_tokens is not None and num_text_tokens > force_max_text_tokens:
+        raise ValueError(
+            f"prompt has {num_text_tokens} tokens, exceeds force_max_text_tokens={force_max_text_tokens}"
+        )
       tokenized.append((token_ids, num_text_tokens))
 
     max_text_tokens = max(num_text for _, num_text in tokenized)
@@ -247,7 +265,7 @@ class IdeogramPipeline:
         "grid_w": grid_w,
     }
 
-  def generate(
+  def denoise(
       self,
       prompts: List[str],
       negative_prompts: Optional[List[str]] = None,
@@ -260,11 +278,13 @@ class IdeogramPipeline:
       schedule_std: float = 1.5,
       seed: int = 42,
   ):
-    if negative_prompts is None:
-      negative_prompts = [""] * len(prompts)
+    """Run text encoding + denoising; return latent tokens for VAE decode.
 
-    all_prompts = prompts + negative_prompts
-    inputs = self._build_inputs_cpu(all_prompts, height, width)
+    Call inside the FSDP mesh context. VAE decode is separate (``decode_latents``)
+    so conv layers are not compiled with FSDP-sharded activations on ROCm.
+    """
+    # negative_prompts is accepted for API compatibility; the uncond CFG branch uses zero LLM features.
+    inputs = self._build_inputs_cpu(prompts, height, width)
 
     batch_size = len(prompts)
     max_text_tokens = inputs["max_text_tokens"]
@@ -283,7 +303,7 @@ class IdeogramPipeline:
     # Build padded LLM features: text features for the positive branch, zeros for image positions.
     image_llm_padding = jnp.zeros((batch_size, num_image_tokens, llm_features.shape[-1]), dtype=jnp.float32)
     # llm_features covers only the text portion; pad with zeros for the image token positions.
-    pos_llm_features = jnp.concatenate([llm_features[:batch_size], image_llm_padding], axis=1)
+    pos_llm_features = jnp.concatenate([llm_features, image_llm_padding], axis=1)
 
     # Initialize z
     key = jax.random.PRNGKey(seed)
@@ -355,23 +375,72 @@ class IdeogramPipeline:
     init_val = (z, pos_llm_features, neg_llm_features)
     z, _, _ = jax.lax.fori_loop(0, num_steps, denoise_step, init_val)
 
-    # 3. Decode
-    # Unpatching logic
+    return z, {
+        "grid_h": inputs["grid_h"],
+        "grid_w": inputs["grid_w"],
+        "batch_size": batch_size,
+    }
+
+  def decode_latents(self, z: jax.Array, decode_meta: dict, *, sync_torch: bool = False) -> jax.Array:
+    """Unpatch denoised tokens and VAE-decode on a single GPU (outside FSDP mesh)."""
+    batch_size = decode_meta["batch_size"]
+    grid_h = decode_meta["grid_h"]
+    grid_w = decode_meta["grid_w"]
+
     patch = 2
     ae_channels = z.shape[-1] // (patch * patch)
 
-    # Apply latent scale and shift
     shift, scale = get_latent_norm()
     z = z * scale + shift
 
-    z = z.reshape((batch_size, inputs["grid_h"], inputs["grid_w"], patch, patch, ae_channels))
+    z = z.reshape((batch_size, grid_h, grid_w, patch, patch, ae_channels))
     z = jnp.transpose(z, (0, 5, 1, 3, 2, 4))
-    z = z.reshape((batch_size, ae_channels, inputs["grid_h"] * patch, inputs["grid_w"] * patch))
-
-    # Convert to NHWC for our Flax Autoencoder and cast to BF16
+    z = z.reshape((batch_size, ae_channels, grid_h * patch, grid_w * patch))
     z = jnp.transpose(z, (0, 2, 3, 1)).astype(jnp.bfloat16)
 
-    images = self.autoencoder.decode(z)
-    images = jnp.clip((images + 1.0) / 2.0, 0.0, 1.0)
+    vae_device = getattr(getattr(self, "config", None), "vae_device", None)
+    if vae_device == "cpu":
+      z_host = jax.device_get(z)
+      graphdef, state, rest_of_state = nnx.split(self.autoencoder, nnx.Param, ...)
+      autoencoder = nnx.merge(graphdef, state, rest_of_state)
+      images = autoencoder.decode(jnp.asarray(z_host))
+      images = jnp.clip((images + 1.0) / 2.0, 0.0, 1.0)
+      return images
 
-    return images
+    device = None
+    if vae_device and vae_device != "gpu":
+      device = jax.devices(vae_device)[0]
+    return decode_latents_with_vae(
+        self.autoencoder,
+        z,
+        vae_device=device,
+        sync_torch=sync_torch,
+    )
+
+  def generate(
+      self,
+      prompts: List[str],
+      negative_prompts: Optional[List[str]] = None,
+      height: int = 1024,
+      width: int = 1024,
+      num_steps: int = 48,
+      guidance_scale: Optional[float] = None,
+      guidance_schedule: Optional[List[float]] = None,
+      schedule_mu: float = 0.0,
+      schedule_std: float = 1.5,
+      seed: int = 42,
+  ):
+    z, decode_meta = self.denoise(
+        prompts=prompts,
+        negative_prompts=negative_prompts,
+        height=height,
+        width=width,
+        num_steps=num_steps,
+        guidance_scale=guidance_scale,
+        guidance_schedule=guidance_schedule,
+        schedule_mu=schedule_mu,
+        schedule_std=schedule_std,
+        seed=seed,
+    )
+    sync_torch = getattr(getattr(self, "config", None), "text_encoder_device", "") == "gpu"
+    return self.decode_latents(z, decode_meta, sync_torch=sync_torch)

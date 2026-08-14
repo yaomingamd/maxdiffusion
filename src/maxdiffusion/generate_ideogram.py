@@ -35,10 +35,12 @@ from absl import app
 
 from maxdiffusion import pyconfig, max_logging, max_utils
 from maxdiffusion.checkpointing.ideogram_checkpointer import IdeogramCheckpointer
+from maxdiffusion.train_utils import transformer_engine_context
 
 
 from maxdiffusion.models.ideogram.sharding_utils import create_sharded_logical_model
 from maxdiffusion.models.ideogram.sampler_configs import get_sampler_preset, guidance_schedule_step_order
+from maxdiffusion.models.ideogram.vae_decode_utils import prepare_vae_single_device
 
 
 def _resolve_sampler_kwargs(config) -> dict:
@@ -83,10 +85,30 @@ def get_git_commit_hash():
     return None
 
 
-jax.config.update("jax_use_shardy_partitioner", False)
+def _configure_shardy_partitioner() -> None:
+  """Select JAX partitioner for Ideogram TE FMHA.
+
+  JAX 0.10+ requires Shardy; GSPMD custom_partitioner fails for TE on ROCm.
+  JAX 0.9.x keeps GSPMD (shardy=False) unless JAX_USE_SHARDY_PARTITIONER is set.
+  TE layer setup may reset this, so call again before compile/inference.
+  """
+  from packaging.version import Version
+
+  if Version(jax.__version__) >= Version("0.10.0"):
+    use_shardy = True
+  else:
+    env = os.environ.get("JAX_USE_SHARDY_PARTITIONER")
+    if env is not None:
+      use_shardy = env.strip().lower() not in ("0", "false", "no", "")
+    else:
+      use_shardy = False
+  jax.config.update("jax_use_shardy_partitioner", use_shardy)
 
 
-def call_pipeline(config, pipeline, prompt, negative_prompt=None):
+_configure_shardy_partitioner()
+
+
+def call_pipeline(config, pipeline, prompt, negative_prompt=None, mesh=None):
   seed = getattr(config, "seed", 42)
   height = getattr(config, "height", 256)
   width = getattr(config, "width", 256)
@@ -107,7 +129,7 @@ def call_pipeline(config, pipeline, prompt, negative_prompt=None):
     prompts = prompt
     negative_prompts = negative_prompt
 
-  images = pipeline.generate(
+  gen_kwargs = dict(
       prompts=prompts,
       negative_prompts=negative_prompts,
       height=height,
@@ -115,6 +137,16 @@ def call_pipeline(config, pipeline, prompt, negative_prompt=None):
       seed=seed,
       **sampler_kwargs,
   )
+  sync_torch = getattr(config, "text_encoder_device", "") == "gpu"
+
+  if mesh is None:
+    z, decode_meta = pipeline.denoise(**gen_kwargs)
+    return pipeline.decode_latents(z, decode_meta, sync_torch=sync_torch)
+
+  with mesh:
+    z, decode_meta = pipeline.denoise(**gen_kwargs)
+    z = jax.block_until_ready(z)
+  images = pipeline.decode_latents(z, decode_meta, sync_torch=sync_torch)
   return images
 
 
@@ -127,7 +159,10 @@ def _apply_pipeline_sharding(config, pipeline, mesh):
     pipeline.unconditional_transformer = create_sharded_logical_model(
         pipeline.unconditional_transformer, logical_axis_rules, mesh
     )
-    pipeline.autoencoder = create_sharded_logical_model(pipeline.autoencoder, logical_axis_rules, mesh)
+  # VAE decode runs replicated on a single GPU — do not FSDP-shard conv weights/activations.
+  vae_device = getattr(config, "vae_device", "gpu")
+  if vae_device != "cpu" and pipeline.autoencoder is not None:
+    pipeline.autoencoder, _ = prepare_vae_single_device(pipeline.autoencoder)
   return pipeline
 
 
@@ -152,6 +187,9 @@ def _save_images(config, out_images, filename_prefix=""):
 
 def run_with_pipeline(config, pipeline, filename_prefix="", mesh=None, skip_warmup=False):
   """Run Ideogram inference on an already-loaded pipeline (e.g. after training)."""
+  # TE DotProductAttention init sets shardy=False; restore JAX 0.10 Shardy before compile.
+  _configure_shardy_partitioner()
+
   if mesh is None:
     devices_array = max_utils.create_device_mesh(config)
     mesh = Mesh(devices_array, config.mesh_axes)
@@ -171,16 +209,14 @@ def run_with_pipeline(config, pipeline, filename_prefix="", mesh=None, skip_warm
     keys["num_inference_steps"] = 2
     keys["guidance_scale"] = 7.0
     max_logging.log("Starting warmup compilation pass (2 steps)...")
-    with mesh:
-      warmup_out = call_pipeline(config, pipeline, prompt, negative_prompt)
-      jax.block_until_ready(warmup_out)
+    warmup_out = call_pipeline(config, pipeline, prompt, negative_prompt, mesh=mesh)
+    jax.block_until_ready(warmup_out)
     if saved_preset is not None:
       keys["ideogram_sampler_preset"] = saved_preset
 
   max_logging.log(f"Starting generation pass ({original_num_steps} steps)...")
-  with mesh:
-    out_images = call_pipeline(config, pipeline, prompt, negative_prompt)
-    out_images = jax.block_until_ready(out_images)
+  out_images = call_pipeline(config, pipeline, prompt, negative_prompt, mesh=mesh)
+  out_images = jax.block_until_ready(out_images)
 
   return _save_images(config, out_images, filename_prefix=filename_prefix)
 
@@ -244,7 +280,13 @@ def run(config, filename_prefix="", commit_hash=None):
     max_logging.log(f"Starting Profiling run ({profiling_steps} steps)...")
     profiler = max_utils.Profiler(config, session_name=f"denoise_profile_{profiling_steps}_steps")
     profiler.start()
-    _ = call_pipeline(config, pipeline, prompt=getattr(config, "prompt", ""), negative_prompt=getattr(config, "negative_prompt", ""))
+    _ = call_pipeline(
+        config,
+        pipeline,
+        prompt=getattr(config, "prompt", ""),
+        negative_prompt=getattr(config, "negative_prompt", ""),
+        mesh=mesh,
+    )
     profiler.stop()
 
   return saved_image_paths
@@ -258,4 +300,5 @@ def main(argv: Sequence[str]) -> None:
 
 
 if __name__ == "__main__":
-  app.run(main)
+  with transformer_engine_context():
+    app.run(main)

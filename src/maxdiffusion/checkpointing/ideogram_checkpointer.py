@@ -113,6 +113,9 @@ class IdeogramCheckpointer:
     restored_checkpoint, step = self.load_ideogram_configs_from_orbax(step)
     opt_state = None
 
+    # TE FMHA sharding needs mesh when transformers are constructed.
+    self.config.get_keys()["mesh"] = self.mesh
+
     if restored_checkpoint:
       max_logging.log("Loading Ideogram pipeline from checkpoint")
       ideogram_state = self._extract_ideogram_state(restored_checkpoint)
