@@ -2,6 +2,7 @@
 from typing import Optional, Any, List
 
 import json
+import os
 
 import numpy as np
 
@@ -15,6 +16,7 @@ from ...models.ideogram.autoencoder_ideogram import AutoEncoder, AutoEncoderPara
 from ...models.ideogram.constants import LLM_TOKEN_INDICATOR
 from ...models.ideogram.ideogram_utils import load_transformer_weights, load_vae_weights
 from ...models.ideogram.torchax_text_encoder import TorchaxQwen3VLTextEncoder
+from ...models.ideogram.jax_qwen3vl_text_encoder import JaxQwen3VLTextEncoder
 from ...models.ideogram.latent_norm import get_latent_norm
 from ...models.ideogram.scheduler import get_schedule_for_resolution, make_step_intervals
 from ...models.ideogram.vae_decode_utils import decode_latents_with_vae
@@ -123,16 +125,26 @@ class IdeogramPipeline:
       unconditional_transformer = _make_transformer(rngs)
       nnx.update(unconditional_transformer, uncond_params)
 
-    # Skip text encoder for pure test for now unless requested
-    max_logging.log("Initializing Torchax Text Encoder...")
+    # Text encoder: JAX (default on GPU) or legacy PyTorch/Torchax path.
     text_encoder_repo = config.pretrained_model_name_or_path
     subfolder = "text_encoder"
+    text_encoder_backend = getattr(config, "text_encoder_backend", None) or os.environ.get(
+        "IDEOGRAM_TEXT_ENCODER_BACKEND", "jax"
+    )
     text_encoder_device = getattr(config, "text_encoder_device", None)
     if not text_encoder_device:
       text_encoder_device = "gpu" if getattr(config, "hardware", "tpu") == "gpu" else "cpu"
-    text_encoder = TorchaxQwen3VLTextEncoder.from_pretrained(
-        text_encoder_repo, subfolder=subfolder, device=text_encoder_device
-    )
+
+    if text_encoder_backend.lower() in ("jax", "flax"):
+      max_logging.log("Initializing JAX Qwen3-VL Text Encoder...")
+      text_encoder = JaxQwen3VLTextEncoder.from_pretrained(
+          text_encoder_repo, subfolder=subfolder, device=text_encoder_device
+      )
+    else:
+      max_logging.log("Initializing Torchax Text Encoder...")
+      text_encoder = TorchaxQwen3VLTextEncoder.from_pretrained(
+          text_encoder_repo, subfolder=subfolder, device=text_encoder_device
+      )
 
     from transformers import AutoTokenizer
 
@@ -442,5 +454,8 @@ class IdeogramPipeline:
         schedule_std=schedule_std,
         seed=seed,
     )
-    sync_torch = getattr(getattr(self, "config", None), "text_encoder_device", "") == "gpu"
+    sync_torch = (
+        getattr(getattr(self, "config", None), "text_encoder_backend", "jax") not in ("jax", "flax")
+        and getattr(getattr(self, "config", None), "text_encoder_device", "") == "gpu"
+    )
     return self.decode_latents(z, decode_meta, sync_torch=sync_torch)

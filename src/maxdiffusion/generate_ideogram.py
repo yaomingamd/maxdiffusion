@@ -137,7 +137,10 @@ def call_pipeline(config, pipeline, prompt, negative_prompt=None, mesh=None):
       seed=seed,
       **sampler_kwargs,
   )
-  sync_torch = getattr(config, "text_encoder_device", "") == "gpu"
+  sync_torch = (
+      getattr(config, "text_encoder_backend", "jax") not in ("jax", "flax")
+      and getattr(config, "text_encoder_device", "") == "gpu"
+  )
 
   if mesh is None:
     z, decode_meta = pipeline.denoise(**gen_kwargs)
