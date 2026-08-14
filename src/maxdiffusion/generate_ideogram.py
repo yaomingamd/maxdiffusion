@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# PyTorch ROCm text encoder requires amdsmi init before JAX import on AMD hosts.
-try:
-  import amdsmi
+import os
 
-  amdsmi.amdsmi_init()
-except Exception:
-  pass
+# PyTorch ROCm text encoder requires amdsmi init before JAX import on AMD hosts.
+# Skip when using pure-JAX text encoder (default).
+if os.environ.get("IDEOGRAM_TEXT_ENCODER_BACKEND", "jax").lower() not in ("jax", "flax"):
+  try:
+    import amdsmi
+
+    amdsmi.amdsmi_init()
+  except Exception:
+    pass
 
 from typing import Sequence
 import jax
@@ -26,7 +30,6 @@ from jax.sharding import Mesh
 
 import time
 
-import os
 import subprocess
 import numpy as np
 from PIL import Image
