@@ -1,5 +1,6 @@
 import functools
 import math
+import os
 from typing import Any, Optional, Tuple
 
 import jax
@@ -191,6 +192,15 @@ class Ideogram4MLP(nnx.Module):
     self.w3 = nnx.Linear(dim, hidden_dim, use_bias=False, rngs=rngs, dtype=dtype)
 
   def __call__(self, x: jax.Array) -> jax.Array:
+    # IDEOGRAM_FUSED_SWIGLU=1: single gate+up GEMM (D→2H) then silu*split.
+    # Helps XLA fuse SwiGLU better than two separate w1/w3 Linears.
+    # Baseline (default): w2(silu(w1(x)) * w3(x)).
+    if os.environ.get("IDEOGRAM_FUSED_SWIGLU", "0") == "1":
+      # nnx.Linear kernel is (in_features, out_features); concat on out axis.
+      gate_up_w = jnp.concatenate([self.w1.kernel.value, self.w3.kernel.value], axis=1)
+      gate_up = jnp.matmul(x, gate_up_w)
+      gate, up = jnp.split(gate_up, 2, axis=-1)
+      return self.w2(jax.nn.silu(gate) * up)
     return self.w2(jax.nn.silu(self.w1(x)) * self.w3(x))
 
 
