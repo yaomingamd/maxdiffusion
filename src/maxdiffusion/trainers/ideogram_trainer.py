@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
@@ -286,17 +287,20 @@ def train_step(state, data, rng, config, schedule_fn):
 
   grad_fn = nnx.value_and_grad(loss_fn)
   loss, grads = grad_fn(state.params)
-  max_grad_norm = jnp.sqrt(
+  # Log pre-clip norm; apply config.max_grad_norm (was previously metrics-only).
+  pre_clip_norm = jnp.sqrt(
       jax.tree_util.tree_reduce(
           lambda acc, x: acc + jnp.sum(jnp.square(x)),
           grads,
           initializer=0.0,
       )
   )
+  if config.max_grad_norm > 0:
+    grads, _ = optax.clip_by_global_norm(config.max_grad_norm).update(grads, state, None)
   metrics = {
       "scalar": {
           "learning/loss": loss,
-          "learning/max_grad_norm": max_grad_norm,
+          "learning/max_grad_norm": pre_clip_norm,
       },
       "scalars": {},
   }
