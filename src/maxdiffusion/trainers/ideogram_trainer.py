@@ -287,16 +287,11 @@ def train_step(state, data, rng, config, schedule_fn):
 
   grad_fn = nnx.value_and_grad(loss_fn)
   loss, grads = grad_fn(state.params)
-  # Log pre-clip norm; apply config.max_grad_norm (was previously metrics-only).
-  pre_clip_norm = jnp.sqrt(
-      jax.tree_util.tree_reduce(
-          lambda acc, x: acc + jnp.sum(jnp.square(x)),
-          grads,
-          initializer=0.0,
-      )
-  )
+  # Log pre-clip global norm; honor config.max_grad_norm (was metrics-only before).
+  pre_clip_norm = optax.global_norm(grads)
   if config.max_grad_norm > 0:
-    grads, _ = optax.clip_by_global_norm(config.max_grad_norm).update(grads, state, None)
+    clip_factor = jnp.minimum(1.0, config.max_grad_norm / (pre_clip_norm + 1e-6))
+    grads = jax.tree_util.tree_map(lambda g: g * clip_factor, grads)
   metrics = {
       "scalar": {
           "learning/loss": loss,
