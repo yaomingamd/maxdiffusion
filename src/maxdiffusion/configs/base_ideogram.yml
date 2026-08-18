@@ -35,6 +35,7 @@ per_device_batch_size: 1
 enable_profiler: False
 enable_ml_diagnostics: False
 profiler_steps: 5
+skip_first_n_steps_for_profiler: 5
 skip_jax_distributed_system: False
 skip_jax_compilation: False
 hardware: "tpu"

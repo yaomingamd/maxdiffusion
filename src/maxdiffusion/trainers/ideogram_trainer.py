@@ -52,6 +52,7 @@ def _to_array(x):
 
 
 class IdeogramTrainer(IdeogramCheckpointer):
+  _profiler: max_utils.Profiler | None = None
 
   def get_data_shardings(self, mesh):
     data_sharding = jax.sharding.NamedSharding(mesh, P(*self.config.data_sharding))
@@ -204,12 +205,36 @@ class IdeogramTrainer(IdeogramCheckpointer):
     rng = jax.random.key(self.config.seed)
     start_step = int(restore_args.get("step", 0)) if restore_args else 0
 
-    example_batch = shard_batch(load_next_batch(train_data_iterator, None, self.config))
-    last_metrics = None
+    first_profiling_step = int(getattr(self.config, "skip_first_n_steps_for_profiler", 0) or 0)
+    profiler_steps = int(getattr(self.config, "profiler_steps", 5) or 5)
+    if max_utils.profiler_enabled(self.config) and first_profiling_step >= self.config.max_train_steps:
+      raise ValueError("Profiling requested but initial profiling step set past training final step")
+    last_profiling_step = int(
+        np.clip(
+            first_profiling_step + profiler_steps - 1,
+            first_profiling_step,
+            self.config.max_train_steps - 1,
+        )
+    )
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    def prepare_batch(prev_batch):
+      """Host load + device_put. Runs on a worker thread to overlap with GPU step."""
+      # reuse_example_batch: keep already-sharded device arrays (no H2D stall).
+      if self.config.reuse_example_batch and prev_batch is not None:
+        return prev_batch
+      raw = load_next_batch(train_data_iterator, None, self.config)
+      return shard_batch(raw)
+
+    example_batch = prepare_batch(None)
+    last_metrics = None
+    # worker0: next batch (CPU + H2D); worker1: metrics I/O — overlaps with GPU like Flux.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      next_batch_future = executor.submit(prepare_batch, example_batch)
       for step in np.arange(start_step, self.config.max_train_steps):
-        next_batch_future = executor.submit(load_next_batch, train_data_iterator, example_batch, self.config)
+        if max_utils.profiler_enabled(self.config) and step == first_profiling_step:
+          self._profiler = max_utils.Profiler(self.config)
+          self._profiler.start()
+
         start_step_time = datetime.datetime.now()
 
         with mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
@@ -220,15 +245,32 @@ class IdeogramTrainer(IdeogramCheckpointer):
         record_scalar_metrics(
             metrics, step_end_time - start_step_time, per_device_tflops, float(learning_rate_scheduler(step))
         )
+
+        # Overlap metrics I/O with waiting on / preparing next batch (Flux-style CPU||GPU).
+        metrics_future = None
         if self.config.write_metrics:
-          write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, self.config)
+          metrics_future = executor.submit(
+              write_metrics, writer, local_metrics_file, running_gcs_metrics, metrics, step, self.config
+          )
+
+        example_batch = next_batch_future.result()
+        if int(step) + 1 < int(self.config.max_train_steps):
+          next_batch_future = executor.submit(prepare_batch, example_batch)
 
         last_metrics = metrics
-        example_batch = shard_batch(next_batch_future.result())
 
         if step != 0 and self.config.checkpoint_every != -1 and step % self.config.checkpoint_every == 0:
+          if metrics_future is not None:
+            metrics_future.result()
           pipeline.conditional_transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
           self.save_checkpoint(step, pipeline, state)
+        elif metrics_future is not None:
+          metrics_future.result()
+
+        if max_utils.profiler_enabled(self.config) and step == last_profiling_step:
+          if self._profiler is not None:
+            self._profiler.stop()
+            self._profiler = None
 
     if self.config.write_metrics and last_metrics is not None:
       write_metrics(
