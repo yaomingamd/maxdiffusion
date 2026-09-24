@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from typing import Sequence
+import os
 
 try:
   import amdsmi
@@ -35,6 +36,22 @@ def train(config):
   import tensorflow as tf
 
   tf.config.set_visible_devices([], "GPU")
+
+  from packaging.version import Version
+
+  if Version(jax.__version__) >= Version("0.10.0"):
+    use_shardy = True
+  else:
+    env = os.environ.get("JAX_USE_SHARDY_PARTITIONER")
+    if env is not None:
+      use_shardy = env.strip().lower() not in ("0", "false", "no", "")
+    else:
+      use_shardy = False
+  if os.environ.get("JAX_USE_SHARDY_PARTITIONER", "").strip().lower() in ("0", "false", "no"):
+    use_shardy = False
+  elif os.environ.get("JAX_USE_SHARDY_PARTITIONER", "").strip().lower() in ("1", "true", "yes", "on"):
+    use_shardy = True
+  jax.config.update("jax_use_shardy_partitioner", use_shardy)
 
   from maxdiffusion.trainers.ideogram_trainer import IdeogramTrainer
 

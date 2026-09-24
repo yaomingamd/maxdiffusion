@@ -6,15 +6,14 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from flax.traverse_util import flatten_dict, unflatten_dict
 from safetensors import safe_open
-import torch
 
 from maxdiffusion import max_logging
 from ..modeling_flax_pytorch_utils import (
     rename_key_and_reshape_tensor,
-    torch2jax,
     validate_flax_state_dict,
 )
 from huggingface_hub import hf_hub_download
@@ -120,10 +119,45 @@ def compute_ideogram_token_dims(height: int, width: int, max_text_tokens: int):
   return grid_h, grid_w, num_image_tokens, seq_len
 
 
+def _register_numpy_extended_dtypes():
+  """Register bf16/fp8 on numpy so safetensors can load Ideogram checkpoints without torch."""
+  import ml_dtypes
+
+  for name in ("bfloat16", "float8_e4m3fn", "float8_e5m2"):
+    if not hasattr(np, name):
+      setattr(np, name, getattr(ml_dtypes, name))
+
+
+def _numpy_to_jax(arr):
+  cpu = jax.local_devices(backend="cpu")[0]
+  dt = str(arr.dtype)
+  if "float8" in dt or dt == "bfloat16":
+    arr = arr.astype(np.float32)
+    return jnp.array(arr, dtype=jnp.bfloat16, device=cpu)
+  return jnp.array(arr, device=cpu)
+
+
+def _load_safetensors_numpy(ckpt_path):
+  _register_numpy_extended_dtypes()
+  tensors = {}
+  with safe_open(ckpt_path, framework="np") as f:
+    for k in f.keys():
+      tensors[k] = _numpy_to_jax(f.get_tensor(k))
+  return tensors
+
+
 def _resolve_checkpoint_path(pretrained_model_name_or_path, subfolder, filename):
   if os.path.isdir(pretrained_model_name_or_path):
     return os.path.join(pretrained_model_name_or_path, subfolder, filename)
   return hf_hub_download(pretrained_model_name_or_path, subfolder=subfolder, filename=filename)
+
+
+def _load_torch_bin(ckpt_path):
+  import torch
+  from ..modeling_flax_pytorch_utils import torch2jax
+
+  loaded_state_dict = torch.load(ckpt_path, map_location="cpu")
+  return {k: torch2jax(v) for k, v in loaded_state_dict.items()}
 
 
 def load_sharded_checkpoint(pretrained_model_name_or_path, subfolder, device, filename=None):
@@ -134,14 +168,8 @@ def load_sharded_checkpoint(pretrained_model_name_or_path, subfolder, device, fi
     try:
       ckpt_path = _resolve_checkpoint_path(pretrained_model_name_or_path, subfolder, filename)
       if filename.endswith(".safetensors"):
-        with safe_open(ckpt_path, framework="pt") as f:
-          for k in f.keys():
-            tensors[k] = torch2jax(f.get_tensor(k))
-      else:
-        loaded_state_dict = torch.load(ckpt_path, map_location="cpu")
-        for k, v in loaded_state_dict.items():
-          tensors[k] = torch2jax(v)
-      return tensors
+        return _load_safetensors_numpy(ckpt_path)
+      return _load_torch_bin(ckpt_path)
     except EntryNotFoundError:
       max_logging.log(f"Warning: Specific file {filename} not found. Falling back to default logic.")
 
@@ -174,13 +202,12 @@ def load_sharded_checkpoint(pretrained_model_name_or_path, subfolder, device, fi
 
     for shard in shards:
       shard_path = _resolve_checkpoint_path(pretrained_model_name_or_path, subfolder, shard)
-      with safe_open(shard_path, framework="pt") as f:
-        for k in f.keys():
-          tensors[k] = torch2jax(f.get_tensor(k))
+      tensors.update(_load_safetensors_numpy(shard_path))
   else:
     # Fallback for non-sharded model
     filename_candidates = ["model.safetensors", "diffusion_pytorch_model.safetensors"]
     ckpt_path = None
+    filename = None
     for candidate_name in filename_candidates:
       candidate_path = (
           os.path.join(pretrained_model_name_or_path, subfolder, candidate_name)
@@ -206,13 +233,9 @@ def load_sharded_checkpoint(pretrained_model_name_or_path, subfolder, device, fi
       )
 
     if filename.endswith(".safetensors"):
-      with safe_open(ckpt_path, framework="pt") as f:
-        for k in f.keys():
-          tensors[k] = torch2jax(f.get_tensor(k))
+      tensors = _load_safetensors_numpy(ckpt_path)
     else:
-      loaded_state_dict = torch.load(ckpt_path, map_location="cpu")
-      for k, v in loaded_state_dict.items():
-        tensors[k] = torch2jax(v)
+      tensors = _load_torch_bin(ckpt_path)
 
   return tensors
 

@@ -15,7 +15,6 @@ from ...models.ideogram.transformer_ideogram import Ideogram4Transformer, Ideogr
 from ...models.ideogram.autoencoder_ideogram import AutoEncoder, AutoEncoderParams
 from ...models.ideogram.constants import LLM_TOKEN_INDICATOR
 from ...models.ideogram.ideogram_utils import load_transformer_weights, load_vae_weights
-from ...models.ideogram.torchax_text_encoder import TorchaxQwen3VLTextEncoder
 from ...models.ideogram.jax_qwen3vl_text_encoder import JaxQwen3VLTextEncoder
 from ...models.ideogram.latent_norm import get_latent_norm
 from ...models.ideogram.scheduler import get_schedule_for_resolution, make_step_intervals
@@ -79,6 +78,10 @@ class IdeogramPipeline:
       activation_dtype = getattr(config, "activations_dtype", jnp.bfloat16)
       attention_kernel = getattr(config, "attention", "dot_product")
       mesh = getattr(config, "mesh", None)
+      remat_policy = getattr(config, "remat_policy", "None")
+      names_which_can_be_saved = getattr(config, "names_which_can_be_saved", []) or []
+      names_which_can_be_offloaded = getattr(config, "names_which_can_be_offloaded", []) or []
+      max_logging.log(f"Ideogram transformer remat_policy={remat_policy}")
 
       def _make_transformer(rngs):
         return Ideogram4Transformer(
@@ -87,6 +90,9 @@ class IdeogramPipeline:
             dtype=activation_dtype,
             attention_kernel=attention_kernel,
             mesh=mesh,
+            remat_policy=remat_policy,
+            names_which_can_be_saved=names_which_can_be_saved,
+            names_which_can_be_offloaded=names_which_can_be_offloaded,
         )
 
       # Load Conditional Transformer
@@ -141,6 +147,8 @@ class IdeogramPipeline:
           text_encoder_repo, subfolder=subfolder, device=text_encoder_device
       )
     else:
+      from ...models.ideogram.torchax_text_encoder import TorchaxQwen3VLTextEncoder
+
       max_logging.log("Initializing Torchax Text Encoder...")
       text_encoder = TorchaxQwen3VLTextEncoder.from_pretrained(
           text_encoder_repo, subfolder=subfolder, device=text_encoder_device
@@ -154,6 +162,9 @@ class IdeogramPipeline:
 
     pipeline = cls(conditional_transformer, unconditional_transformer, autoencoder, text_encoder, tokenizer)
     pipeline.config = config
+    import sys
+
+    max_logging.log(f"Ideogram pipeline loaded; torch imported={('torch' in sys.modules)}")
     return pipeline
 
   def _reorder_caption_keys(self, parsed: dict) -> dict:

@@ -236,12 +236,16 @@ class IdeogramTrainer(IdeogramCheckpointer):
           self._profiler.start()
 
         start_step_time = datetime.datetime.now()
+        max_logging.log(f"train_step dispatch step={int(step)}")
 
         with mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
           state, metrics, rng = p_train_step(state, example_batch, rng)
           metrics["scalar"]["learning/loss"].block_until_ready()
 
         step_end_time = datetime.datetime.now()
+        max_logging.log(
+            f"train_step done step={int(step)} wall={(step_end_time - start_step_time).total_seconds():.3f}s"
+        )
         record_scalar_metrics(
             metrics, step_end_time - start_step_time, per_device_tflops, float(learning_rate_scheduler(step))
         )

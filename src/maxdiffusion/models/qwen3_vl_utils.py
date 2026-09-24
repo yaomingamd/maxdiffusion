@@ -66,20 +66,18 @@ def _torch_key_to_nnx_path(key: str) -> Tuple[tuple, bool] | None:
 
 
 def _load_safetensors_dir(model_dir: str) -> Dict[str, np.ndarray]:
-  import torch
+  import ml_dtypes
   from safetensors import safe_open
+
+  for name in ("bfloat16", "float8_e4m3fn", "float8_e5m2"):
+    if not hasattr(np, name):
+      setattr(np, name, getattr(ml_dtypes, name))
 
   out: Dict[str, np.ndarray] = {}
   for shard in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
-    with safe_open(shard, framework="pt", device="cpu") as st:
+    with safe_open(shard, framework="np") as st:
       for key in st.keys():
-        t = st.get_tensor(key)
-        if t.dtype == torch.float8_e4m3fn:
-          out[key] = t.float().numpy()
-        elif t.dtype == torch.bfloat16:
-          out[key] = t.float().numpy()
-        else:
-          out[key] = t.float().numpy()
+        out[key] = st.get_tensor(key).astype(np.float32)
   return out
 
 

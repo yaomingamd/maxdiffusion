@@ -1,7 +1,8 @@
 import functools
+import inspect
 import math
 import os
-from typing import Any, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,144 @@ from dataclasses import dataclass
 import flax.linen as nn
 from flax import nnx
 from jax.sharding import Mesh
+from packaging.version import Version
+
+from maxdiffusion import max_logging
+from maxdiffusion.models.gradient_checkpoint import GradientCheckpointType
+
+# NVIDIA TE 2.14 (#2823) dropped is_thd/is_segment_ids_reordered and made
+# segment_pos required. ROCm TE 2.12 still has the old factory; 2.15/2.17 have the new one.
+_TE_SEQ_DESC_API_CUTOFF = Version("2.14")
+_TE_FLASH_CFG_LOGGED = False
+TePaddingMode = Literal["seq_desc", "bias", "no_mask"]
+
+
+def _te_base_version() -> Version:
+  """Parse Transformer Engine version, stripping local/ROCm suffixes (e.g. 2.17.0+rocm7...)."""
+  try:
+    import transformer_engine as te  # pytype: disable=import-error
+
+    raw = str(getattr(te, "__version__", "0"))
+    return Version(raw.split("+")[0].split("-rc")[0])
+  except Exception:
+    return Version("0")
+
+
+def _te_seq_desc_needs_is_thd() -> bool:
+  """True on TE 2.12 (required kwargs). False on TE 2.14+ (segment_pos only)."""
+  from transformer_engine.jax.attention import SequenceDescriptor  # pytype: disable=import-error
+
+  params = inspect.signature(SequenceDescriptor.from_segment_ids_and_pos).parameters
+  return "is_thd" in params
+
+
+def _te_padding_mode_from_env(te_version: Version) -> TePaddingMode:
+  """Pick fused-attn padding path. Env overrides win; otherwise TE version.
+
+  SequenceDescriptor BSHD padding uses from_seqlens with segment_ids replicated
+  onto the same (BATCH, LENGTH) mesh as Q. That avoids the 8-GPU hang where Q was
+  all-gathered to global batch while seqlens stayed FSDP-local (batch=1).
+  """
+  del te_version
+  no_mask = os.environ.get("IDEOGRAM_TE_NO_MASK", "0") == "1"
+  seq_desc = os.environ.get("IDEOGRAM_TE_SEQ_DESC", "0") == "1"
+  padding = os.environ.get("IDEOGRAM_TE_PADDING", "auto").strip().lower()
+  if no_mask:
+    return "no_mask"
+  if seq_desc:
+    return "seq_desc"
+  if padding in ("seq_desc", "bias", "no_mask"):
+    return padding  # type: ignore[return-value]
+  # auto: SequenceDescriptor padding on both TE 2.12 and 2.17
+  return "seq_desc"
+
+
+def _use_shardy_partitioner() -> bool:
+  """Match TE's partitioner choice: env wins, else JAX default by version.
+
+  JAX 0.9.1 used GSPMD (`JAX_USE_SHARDY_PARTITIONER=0`). JAX 0.10+ / 0.11 TE
+  requires Shardy (env=1 or unset default True).
+  """
+  raw = os.environ.get("JAX_USE_SHARDY_PARTITIONER")
+  if raw is not None and raw.strip() != "":
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+  try:
+    return bool(jax.config.jax_use_shardy_partitioner)
+  except Exception:
+    return Version(jax.__version__) >= Version("0.10.0")
+
+
+def _mesh_axis_size(mesh: Optional[Mesh], axis: str) -> int:
+  if mesh is None:
+    return 1
+  try:
+    return int(mesh.shape[axis])
+  except Exception:
+    return 1
+
+
+def _te_head_plan(num_heads: int, mesh: Optional[Mesh]) -> Tuple[int, str]:
+  """How to present heads to TE fused attn on this mesh.
+
+  Ideogram has 18 heads; FSDP=8 does not divide 18. JAX 0.9.1 + GSPMD ran the
+  native 18-head TE path with finite loss. JAX 0.11 + Shardy NaN'd after step 0
+  until heads were padded to a multiple of fsdp (18→24).
+
+  auto: pad only when Shardy is on (JAX 0.10+ or JAX_USE_SHARDY_PARTITIONER=1).
+  Overrides: pad|none|fsdp.
+  """
+  mode = os.environ.get("IDEOGRAM_TE_HEAD_SHARD", "auto").strip().lower()
+  fsdp = _mesh_axis_size(mesh, "fsdp")
+  if mode in ("none", "replicate", "unshard"):
+    return num_heads, "none"
+  if fsdp <= 1 or num_heads % fsdp == 0:
+    return num_heads, "fsdp"
+  if mode in ("fsdp", "shard"):
+    return num_heads, "fsdp"
+  shardy = _use_shardy_partitioner()
+  if mode == "pad" or (mode == "auto" and shardy):
+    pad_to = num_heads + (fsdp - num_heads % fsdp)
+    return pad_to, "pad"
+  return num_heads, "fsdp"
+
+
+def _make_te_sequence_descriptor(segment_ids: jax.Array, needs_is_thd: bool):
+  """BSHD right-padding SequenceDescriptor for TE 2.12 and 2.17.
+
+  Ideogram FSDP shards data batch across the full mesh, but TE Q/K/V are
+  constrained to (activation_batch=data, activation_length=context, heads=fsdp).
+  With data=1, context=1, fsdp=8 that all-gathers Q to global batch while leaving
+  unconstrained segment_ids local (batch=1). ROCm then converts BSHD+padding to
+  THD with cu_seqlens of the wrong batch and deadlocks.
+
+  Replicate segment_ids onto the same batch/seq mesh as Q, then use from_seqlens
+  (the stable non-THD factory on both TE 2.12 and 2.17).
+  """
+  from transformer_engine.jax.attention import SequenceDescriptor  # pytype: disable=import-error
+  from maxdiffusion.models.attention_flax import BATCH, LENGTH
+
+  te_segment_ids = jnp.where(segment_ids > 0, 1, 0).astype(jnp.int32)
+  te_segment_ids = jax.lax.with_sharding_constraint(
+      te_segment_ids, nn.logical_to_mesh_axes((BATCH, LENGTH))
+  )
+  q_seqlens = jnp.sum(te_segment_ids, axis=-1).astype(jnp.int32)
+  q_seqlens = jax.lax.with_sharding_constraint(q_seqlens, nn.logical_to_mesh_axes((BATCH,)))
+  factory = os.environ.get("IDEOGRAM_TE_SEQ_DESC_FACTORY", "seqlens").strip().lower()
+  if factory in ("ids", "segment_ids", "from_segment_ids_and_pos"):
+    seq_len = te_segment_ids.shape[-1]
+    segment_pos = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32)[None, :], te_segment_ids.shape)
+    if needs_is_thd:
+      return SequenceDescriptor.from_segment_ids_and_pos(
+          segment_ids=te_segment_ids,
+          segment_pos=segment_pos,
+          is_thd=False,
+          is_segment_ids_reordered=False,
+      )
+    return SequenceDescriptor.from_segment_ids_and_pos(
+        segment_ids=te_segment_ids,
+        segment_pos=segment_pos,
+    )
+  return SequenceDescriptor.from_seqlens(seqlens=(q_seqlens, q_seqlens))
 
 
 @dataclass
@@ -110,13 +249,41 @@ class Ideogram4Attention(nnx.Module):
     if attention_kernel == "cudnn_flash_te":
       from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
 
-      jax.config.update("jax_use_shardy_partitioner", False)
+      # JAX 0.10+ TE custom_partitioner requires Shardy. Honor env; default on
+      # for >=0.10 so we do not force GSPMD (that breaks JAX 0.11).
+      use_shardy = _use_shardy_partitioner()
+      jax.config.update("jax_use_shardy_partitioner", use_shardy)
+
+      te_version = _te_base_version()
+      self._te_padding_mode = _te_padding_mode_from_env(te_version)
+      self._te_seq_desc_needs_is_thd = _te_seq_desc_needs_is_thd()
+      self._te_seq_desc = self._te_padding_mode == "seq_desc"
+      self._te_no_mask = self._te_padding_mode == "no_mask"
+      self._te_num_heads, self._te_head_mode = _te_head_plan(num_heads, mesh)
+      if self._te_seq_desc:
+        attn_mask_type, attn_bias_type = "padding", "NO_BIAS"
+      elif self._te_no_mask:
+        attn_mask_type, attn_bias_type = "no_mask", "NO_BIAS"
+      else:
+        attn_mask_type, attn_bias_type = "no_mask", "POST_SCALE_BIAS"
+      global _TE_FLASH_CFG_LOGGED
+      if not _TE_FLASH_CFG_LOGGED:
+        _TE_FLASH_CFG_LOGGED = True
+        max_logging.log(
+            "Ideogram TE fused attn: te="
+            f"{te_version} jax={jax.__version__} padding_mode={self._te_padding_mode} "
+            f"seq_desc_is_thd={self._te_seq_desc_needs_is_thd} "
+            f"seq_desc_factory={os.environ.get('IDEOGRAM_TE_SEQ_DESC_FACTORY', 'seqlens')} "
+            f"attn_mask_type={attn_mask_type} attn_bias_type={attn_bias_type} "
+            f"shardy={use_shardy} heads={num_heads} te_heads={self._te_num_heads} "
+            f"head_mode={self._te_head_mode} fsdp={_mesh_axis_size(mesh, 'fsdp')}"
+        )
       dpa = DotProductAttention(
           head_dim=self.head_dim,
-          num_attention_heads=num_heads,
-          num_gqa_groups=num_heads,
-          attn_mask_type="padding",
-          attn_bias_type="NO_BIAS",
+          num_attention_heads=self._te_num_heads,
+          num_gqa_groups=self._te_num_heads,
+          attn_mask_type=attn_mask_type,
+          attn_bias_type=attn_bias_type,
           dtype=dtype,
           qkv_layout="BSHD_BSHD_BSHD",
           scale_factor=1.0 / math.sqrt(self.head_dim),
@@ -138,25 +305,42 @@ class Ideogram4Attention(nnx.Module):
 
   def _te_flash_attention(self, q: jax.Array, k: jax.Array, v: jax.Array, segment_ids: jax.Array) -> jax.Array:
     from maxdiffusion.models.attention_flax import BATCH, D_KV, HEAD, LENGTH
-    from transformer_engine.jax.attention import SequenceDescriptor  # pytype: disable=import-error
 
     q_bshd = jnp.transpose(q, (0, 2, 1, 3))
     k_bshd = jnp.transpose(k, (0, 2, 1, 3))
     v_bshd = jnp.transpose(v, (0, 2, 1, 3))
 
-    axis_names = nn.logical_to_mesh_axes((BATCH, LENGTH, HEAD, D_KV))
+    te_heads = getattr(self, "_te_num_heads", q_bshd.shape[2])
+    head_pad = te_heads - q_bshd.shape[2]
+    if head_pad > 0:
+      pad_cfg = ((0, 0), (0, 0), (0, head_pad), (0, 0))
+      q_bshd = jnp.pad(q_bshd, pad_cfg)
+      k_bshd = jnp.pad(k_bshd, pad_cfg)
+      v_bshd = jnp.pad(v_bshd, pad_cfg)
+
+    head_mode = getattr(self, "_te_head_mode", "fsdp")
+    head_axis = None if head_mode == "none" else HEAD
+    axis_names = nn.logical_to_mesh_axes((BATCH, LENGTH, head_axis, D_KV))
     q_bshd = jax.lax.with_sharding_constraint(q_bshd, axis_names)
     k_bshd = jax.lax.with_sharding_constraint(k_bshd, axis_names)
     v_bshd = jax.lax.with_sharding_constraint(v_bshd, axis_names)
 
-    te_segment_ids = jnp.where(segment_ids > 0, 1, 0).astype(jnp.int32)
-    sequence_descriptor = SequenceDescriptor.from_segment_ids_and_pos(
-        segment_ids=te_segment_ids,
-        segment_pos=None,
-        is_thd=False,
-        is_segment_ids_reordered=False,
-    )
-    out_bshd = self.dpa_layer(q_bshd, k_bshd, v_bshd, sequence_descriptor=sequence_descriptor)
+    if getattr(self, "_te_no_mask", False):
+      out_bshd = self.dpa_layer(q_bshd, k_bshd, v_bshd, mask=None)
+    elif not getattr(self, "_te_seq_desc", False):
+      te_segment_ids = jnp.where(segment_ids > 0, 1, 0).astype(jnp.int32)
+      valid = te_segment_ids > 0
+      keep = valid[:, :, None] & valid[:, None, :]
+      bias = jnp.where(keep, jnp.asarray(0.0, dtype=self.dtype), jnp.asarray(-1.0e10, dtype=self.dtype))
+      bias = bias[:, None, :, :]
+      out_bshd = self.dpa_layer(q_bshd, k_bshd, v_bshd, mask=None, bias=bias)
+    else:
+      sequence_descriptor = _make_te_sequence_descriptor(
+          segment_ids, getattr(self, "_te_seq_desc_needs_is_thd", False)
+      )
+      out_bshd = self.dpa_layer(q_bshd, k_bshd, v_bshd, sequence_descriptor=sequence_descriptor)
+    if head_pad > 0:
+      out_bshd = out_bshd[:, :, : self.num_heads, :]
     return jnp.transpose(out_bshd, (0, 2, 1, 3))
 
   def __call__(self, x: jax.Array, segment_ids: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
@@ -314,11 +498,18 @@ class Ideogram4Transformer(nnx.Module):
       dtype=jnp.bfloat16,
       attention_kernel: str = "dot_product",
       mesh: Optional[Mesh] = None,
+      remat_policy: str = "None",
+      names_which_can_be_saved: Optional[list] = None,
+      names_which_can_be_offloaded: Optional[list] = None,
   ):
     self.config = config
     self.dtype = dtype
     self.attention_kernel = attention_kernel
     self.mesh = mesh
+    self.remat_policy = remat_policy if remat_policy else "None"
+    self.gradient_checkpoint = GradientCheckpointType.from_str(self.remat_policy)
+    self.names_which_can_be_saved = list(names_which_can_be_saved or [])
+    self.names_which_can_be_offloaded = list(names_which_can_be_offloaded or [])
 
     head_dim = config.emb_dim // config.num_heads
 
@@ -408,7 +599,16 @@ class Ideogram4Transformer(nnx.Module):
     sin = sin.astype(self.dtype)
 
     for layer in self.layers:
-      h = layer(h, segment_ids=segment_ids, cos=cos, sin=sin, adaln_input=adaln_input)
+      def _layer_forward(hidden, segs, rope_cos, rope_sin, adaln, lyr=layer):
+        return lyr(hidden, segment_ids=segs, cos=rope_cos, sin=rope_sin, adaln_input=adaln)
+
+      rematted_forward = self.gradient_checkpoint.apply(
+          _layer_forward,
+          self.names_which_can_be_saved,
+          self.names_which_can_be_offloaded,
+          prevent_cse=True,
+      )
+      h = rematted_forward(h, segment_ids, cos, sin, adaln_input)
 
     out = self.final_layer(h, c=adaln_input)
     return out

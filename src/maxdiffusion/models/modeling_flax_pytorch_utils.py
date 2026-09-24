@@ -14,8 +14,8 @@
 # limitations under the License.
 """PyTorch - Flax general utilities."""
 import re
+from typing import Any
 
-import torch
 import jax
 import jax.numpy as jnp
 from flax.linen import Partitioned
@@ -56,7 +56,9 @@ def validate_flax_state_dict(expected_pytree: dict, new_pytree: dict):
       max_logging.log(f"key: {key} not found...")
 
 
-def torch2jax(torch_tensor: torch.Tensor) -> Array:
+def torch2jax(torch_tensor: Any) -> Array:
+  import torch
+
   is_bfloat16 = torch_tensor.dtype == torch.bfloat16
   is_float8 = torch_tensor.dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None))
   if is_bfloat16 or is_float8:

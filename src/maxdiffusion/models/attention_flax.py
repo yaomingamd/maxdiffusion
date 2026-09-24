@@ -15,6 +15,7 @@
 import contextlib
 import functools
 import math
+import os
 from typing import Optional, Callable, Tuple, Any, Dict
 import flax.linen as nn
 from flax import nnx
@@ -65,6 +66,26 @@ CROSS_ATTN_KV_LENGTH = common_types.CROSS_ATTN_KV_LENGTH
 
 INTERNAL_RING_AXIS = "ring"
 INTERNAL_ULYSSES_AXIS = "ulysses"
+
+
+def _apply_shardy_partitioner_from_env() -> None:
+  """Honor JAX_USE_SHARDY_PARTITIONER for TE fused attention.
+
+  MaxDiffusion used to force GSPMD off here (jax_use_shardy_partitioner=False),
+  which breaks JAX 0.11 + Transformer Engine. JAX already reads the env at
+  import time; this applies it again so a later export still wins.
+
+  - JAX_USE_SHARDY_PARTITIONER=1/true  → Shardy (required for JAX 0.11 + TE)
+  - JAX_USE_SHARDY_PARTITIONER=0/false → GSPMD (JAX 0.9.1)
+  - unset → leave jax.config unchanged (JAX 0.11 default is True)
+  """
+  raw = os.environ.get("JAX_USE_SHARDY_PARTITIONER")
+  if raw is None or raw.strip() == "":
+    return
+  jax.config.update(
+      "jax_use_shardy_partitioner",
+      raw.strip().lower() in ("1", "true", "yes", "on"),
+  )
 
 
 def _coerce_tokamax_block_sizes(block_sizes):
@@ -2191,7 +2212,7 @@ class NNXAttentionOp(nnx.Module):
     if attention_kernel == "cudnn_flash_te":
       from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
 
-      jax.config.update("jax_use_shardy_partitioner", False)
+      _apply_shardy_partitioner_from_env()
 
       dpa_layer = DotProductAttention(
           head_dim=dim_head,
@@ -2286,7 +2307,7 @@ class AttentionOp(nn.Module):
     if self.attention_kernel == "cudnn_flash_te":
       from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
 
-      jax.config.update("jax_use_shardy_partitioner", False)
+      _apply_shardy_partitioner_from_env()
 
       dpa_layer = DotProductAttention(
           head_dim=self.dim_head,
